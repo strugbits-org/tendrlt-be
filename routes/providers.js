@@ -7,6 +7,7 @@ const { authenticate, authorize } = require('../middleware/auth');
 const { notifyChannel } = require('../lib/realtimeService');
 const { sendNewProviderSubmittedEmail } = require('../lib/verificationEmails');
 const paymentCrypto = require('../lib/paymentCrypto');
+const { createVerificationSession } = require('../lib/didit');
 
 const router = express.Router();
 
@@ -68,6 +69,38 @@ router.get('/me', authenticate, authorize('provider'), async (req, res) => {
   } catch (err) {
     console.error('GET /api/providers/me error:', err);
     res.status(500).json({ success: false, message: 'Failed to load profile.' });
+  }
+});
+
+// ============================================================
+// POST /api/providers/verification/session
+// Creates a hosted Didit verification session and stores the session id so
+// the webhook can later match its update back to this provider. Returns the
+// hosted URL for the frontend to redirect the provider to (full navigation,
+// same pattern as the Google OAuth flow — see app/(auth)/auth/page.tsx).
+// ============================================================
+router.post('/verification/session', authenticate, authorize('provider'), async (req, res) => {
+  try {
+    const callbackUrl = `${process.env.FRONTEND_URL}/provider-onboarding?step=6`;
+    const { sessionId, url } = await createVerificationSession({
+      providerId: req.user.id,
+      callbackUrl,
+    });
+
+    await db.queryAsUser(req.user.id,
+      `INSERT INTO public.provider_profiles (provider_id, didit_session_id, didit_status)
+       VALUES ($1, $2, 'pending')
+       ON CONFLICT (provider_id) DO UPDATE
+         SET didit_session_id = $2,
+             didit_status     = 'pending',
+             updated_at       = NOW()`,
+      [req.user.id, sessionId]
+    );
+
+    res.json({ success: true, url });
+  } catch (err) {
+    console.error('POST /api/providers/verification/session error:', err);
+    res.status(500).json({ success: false, message: 'Failed to start identity verification.' });
   }
 });
 

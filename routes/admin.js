@@ -61,6 +61,10 @@ router.get('/verifications', async (req, res) => {
         u.parish        AS home_parish,
         p.bio,
         p.verification_status,
+        p.didit_status,
+        p.didit_document_type,
+        p.didit_check_summary,
+        p.didit_verified_at,
         p.documents,
         -- Use the latest submission (resubmission wins) so the SLA clock resets.
         COALESCE(p.resubmitted_at, p.submitted_at) AS submitted_at,
@@ -104,6 +108,12 @@ router.get('/verifications', async (req, res) => {
         cats:               Array.isArray(r.services) ? r.services : [],
         bio:                r.bio || '',
         verification_status: r.verification_status,
+        // Independent automated signal from Didit (ID + liveness + face-match) —
+        // separate from verification_status, which is the manual admin review.
+        diditStatus:        r.didit_status,
+        diditDocumentType:  r.didit_document_type,
+        diditCheckSummary:  r.didit_check_summary,
+        diditVerifiedAt:    r.didit_verified_at,
         submittedAt:        r.submitted_at,
         rejectionReason:    r.rejection_reason,
         rejectionNotes:     r.rejection_notes,

@@ -1,6 +1,7 @@
 const express = require('express');
 const db = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
+const { requireIdentityVerified } = require('../middleware/verification');
 const { notifyUser, notifyChannel } = require('../lib/realtimeService');
 const { sendNewQuoteEmail, sendQuoteAcceptedEmail } = require('../lib/quoteEmails');
 const { sendPushToUser } = require('../lib/pushService');
@@ -18,7 +19,7 @@ const VALID_TIMELINES = ['same_day', 'next_day', '2_3_days', 'within_1_week', '1
 // Provider submits a quote for an open tender.
 // Body: { tender_id, amount, timeline, preferred_start_date, message, what_is_included }
 // ============================================================
-router.post('/', authenticate, authorize('provider'), async (req, res) => {
+router.post('/', authenticate, authorize('provider'), requireIdentityVerified, async (req, res) => {
   const { tender_id, amount, timeline, preferred_start_date, message, what_is_included } = req.body;
 
   if (!tender_id) return res.status(400).json({ success: false, message: 'tender_id is required.' });

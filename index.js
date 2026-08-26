@@ -15,6 +15,7 @@ const pushRoutes          = require('./routes/push');
 const contactRoutes       = require('./routes/contact');
 const feedbackRoutes      = require('./routes/feedback');
 const feesRoutes          = require('./routes/fees');
+const webhooksRoutes      = require('./routes/webhooks');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -27,6 +28,11 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
+// Mounted before express.json() so this route's own express.raw() middleware
+// gets the untouched request body — needed to verify the Didit webhook
+// signature over the exact bytes sent (see routes/webhooks.js).
+app.use('/api/webhooks', webhooksRoutes);
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
