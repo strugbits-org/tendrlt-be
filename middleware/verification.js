@@ -18,7 +18,7 @@ async function requireIdentityVerified(req, res, next) {
     `, [req.user.id]);
 
     const profile = result.rows[0];
-    if (!profile || profile.verification_status !== 'approved' || profile.didit_status !== 'approved') {
+    if (!profile || profile.verification_status !== 'approved') {
       return res.status(403).json({
         success: false,
         code: 'IDENTITY_VERIFICATION_REQUIRED',
