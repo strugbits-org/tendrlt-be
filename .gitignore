@@ -61,4 +61,7 @@ config.local.json
 # Misc
 *.env
 .envrc
-config.bat
+
+# editor / agent local config
+.vscode/
+.claude/settings.local.json
