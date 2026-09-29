@@ -7,7 +7,7 @@ const { authenticate, authorize } = require('../middleware/auth');
 const { notifyChannel } = require('../lib/realtimeService');
 const { sendNewProviderSubmittedEmail } = require('../lib/verificationEmails');
 const paymentCrypto = require('../lib/paymentCrypto');
-const { createVerificationSession } = require('../lib/didit');
+const { createVerificationSession, getSessionDecision, mapDiditStatus, extractCheckSummary } = require('../lib/didit');
 
 const router = express.Router();
 
@@ -101,6 +101,56 @@ router.post('/verification/session', authenticate, authorize('provider'), async 
   } catch (err) {
     console.error('POST /api/providers/verification/session error:', err);
     res.status(500).json({ success: false, message: 'Failed to start identity verification.' });
+  }
+});
+
+// ============================================================
+// POST /api/providers/verification/refresh
+// "Refresh status" on the onboarding page. GET /me only reflects whatever the
+// Didit webhook has already written to our DB — if that webhook never lands
+// (unreachable backend URL, dropped delivery, etc.) the stored didit_status
+// is stuck on 'pending' forever and refreshing never helps. This instead
+// polls Didit directly for the session's current decision and writes it,
+// so refresh can recover even when the webhook never arrived.
+// ============================================================
+router.post('/verification/refresh', authenticate, authorize('provider'), async (req, res) => {
+  try {
+    const result = await db.queryAsUser(req.user.id,
+      `SELECT didit_session_id, didit_status FROM public.provider_profiles WHERE provider_id = $1`,
+      [req.user.id]
+    );
+    const row = result.rows[0];
+    const sessionId = row?.didit_session_id;
+
+    if (!sessionId) {
+      return res.json({ success: true, diditStatus: row?.didit_status || 'not_started' });
+    }
+
+    const decision = await getSessionDecision(sessionId);
+    const diditStatus = mapDiditStatus(decision?.status);
+
+    if (!diditStatus) {
+      // Still non-terminal at Didit (e.g. in progress) — nothing new to write.
+      return res.json({ success: true, diditStatus: row?.didit_status || 'pending' });
+    }
+
+    const { documentType, checkSummary } = extractCheckSummary(decision);
+
+    await db.queryAsUser(req.user.id,
+      `UPDATE public.provider_profiles
+         SET didit_status        = $1,
+             didit_check_summary = $2::jsonb,
+             didit_document_type = $3,
+             didit_verified_at   = CASE WHEN $1 = 'approved' THEN NOW() ELSE didit_verified_at END,
+             didit_updated_at    = NOW()
+       WHERE provider_id = $4`,
+      [diditStatus, JSON.stringify(checkSummary), documentType, req.user.id]
+    );
+
+    res.json({ success: true, diditStatus });
+  } catch (err) {
+    console.error('POST /api/providers/verification/refresh error:', err);
+    res.status(500).json({ success: false, message: 'Failed to refresh verification status.' });
   }
 });
 
@@ -357,6 +407,13 @@ router.delete('/upload/portfolio', authenticate, authorize('provider'), async (r
     return res.status(400).json({ success: false, message: 'path is required.' });
   }
 
+  // Portfolio paths are namespaced as `${providerId}/portfolio/...` — reject
+  // anything outside the caller's own namespace so one provider can't delete
+  // another provider's file from storage.
+  if (!filePath.startsWith(`${req.user.id}/`)) {
+    return res.status(403).json({ success: false, message: 'You do not have permission to delete this file.' });
+  }
+
   const { error: deleteError } = await supabase.storage
     .from('provider-portfolio')
     .remove([filePath]);
@@ -527,8 +584,13 @@ router.get('/earnings', authenticate, authorize('provider'), async (req, res) =>
 router.get('/payment', authenticate, authorize('provider'), async (req, res) => {
   try {
     const result = await db.queryAsUser(req.user.id,
-      `SELECT account_ownership, business_name, payee_first_name, payee_surname,
+      `SELECT account_ownership, business_name, payee_first_name, middle_initial, payee_surname,
+              recipient_id, recipient_bank_type,
+              contact_address_line1, contact_address_line2, contact_address_line3,
+              contact_city, contact_country, contact_state, contact_zip,
+              contact_phone, contact_email,
               bank_name, bank_branch, swift_code, transit_code, bank_address,
+              bank_city, bank_country, bank_state, bank_zip,
               account_type, currency, account_number_last4,
               (aba_routing_encrypted IS NOT NULL) AS has_aba
          FROM public.provider_payment_details
@@ -555,12 +617,27 @@ router.put('/payment', authenticate, authorize('provider'), async (req, res) => 
     account_ownership,
     business_name,
     payee_first_name,
+    middle_initial,
     payee_surname,
+    recipient_id,
+    contact_address_line1,
+    contact_address_line2,
+    contact_address_line3,
+    contact_city,
+    contact_country,
+    contact_state,
+    contact_zip,
+    contact_phone,
+    contact_email,
     bank_name,
     bank_branch,
     swift_code,
     transit_code,
     bank_address,
+    bank_city,
+    bank_country,
+    bank_state,
+    bank_zip,
     account_type,
     currency,
     account_number,   // raw — encrypted here, never stored in the clear
@@ -583,6 +660,7 @@ router.put('/payment', authenticate, authorize('provider'), async (req, res) => 
     const errors = [];
     if (!payee_first_name || !String(payee_first_name).trim()) errors.push('payee first name');
     if (!payee_surname || !String(payee_surname).trim())       errors.push('payee surname');
+    if (!recipient_id || !String(recipient_id).trim())         errors.push('recipient ID');
     if (!bank_name || !String(bank_name).trim())               errors.push('bank name');
     if (!account_type || !String(account_type).trim())         errors.push('account type');
     if (!acctNumClean && !hasRow)                              errors.push('account number');
@@ -605,12 +683,27 @@ router.put('/payment', authenticate, authorize('provider'), async (req, res) => 
       ownership,
       ownership === 'business' ? String(business_name).trim() : null,
       String(payee_first_name).trim(),
+      ownership === 'personal' && middle_initial ? String(middle_initial).trim() : null,
       String(payee_surname).trim(),
+      String(recipient_id).trim(),
+      contact_address_line1 ? String(contact_address_line1).trim() : null,
+      contact_address_line2 ? String(contact_address_line2).trim() : null,
+      contact_address_line3 ? String(contact_address_line3).trim() : null,
+      contact_city    ? String(contact_city).trim()    : null,
+      contact_country ? String(contact_country).trim() : 'Jamaica',
+      contact_state   ? String(contact_state).trim()   : null,
+      contact_zip     ? String(contact_zip).trim()     : null,
+      contact_phone   ? String(contact_phone).trim()   : null,
+      contact_email   ? String(contact_email).trim()   : null,
       String(bank_name).trim(),
       bank_branch ? String(bank_branch).trim() : null,
       swift_code ? String(swift_code).trim() : null,
       transit_code ? String(transit_code).trim() : null,
       bank_address ? String(bank_address).trim() : null,
+      bank_city    ? String(bank_city).trim()    : null,
+      bank_country ? String(bank_country).trim() : 'Jamaica',
+      bank_state   ? String(bank_state).trim()   : null,
+      bank_zip     ? String(bank_zip).trim()     : null,
       String(account_type).trim(),
       currency ? String(currency).trim() : 'jmd',
       abaEnc,
@@ -622,21 +715,40 @@ router.put('/payment', authenticate, authorize('provider'), async (req, res) => 
       const last4   = paymentCrypto.last4(acctNumClean);
       await db.queryAsUser(req.user.id,
         `INSERT INTO public.provider_payment_details
-           (provider_id, account_ownership, business_name, payee_first_name, payee_surname,
+           (provider_id, account_ownership, business_name, payee_first_name, middle_initial, payee_surname,
+            recipient_id,
+            contact_address_line1, contact_address_line2, contact_address_line3,
+            contact_city, contact_country, contact_state, contact_zip, contact_phone, contact_email,
             bank_name, bank_branch, swift_code, transit_code, bank_address,
+            bank_city, bank_country, bank_state, bank_zip,
             account_type, currency, aba_routing_encrypted,
             account_number_encrypted, account_number_last4)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
          ON CONFLICT (provider_id) DO UPDATE SET
             account_ownership        = EXCLUDED.account_ownership,
             business_name            = EXCLUDED.business_name,
             payee_first_name         = EXCLUDED.payee_first_name,
+            middle_initial           = EXCLUDED.middle_initial,
             payee_surname            = EXCLUDED.payee_surname,
+            recipient_id             = EXCLUDED.recipient_id,
+            contact_address_line1    = EXCLUDED.contact_address_line1,
+            contact_address_line2    = EXCLUDED.contact_address_line2,
+            contact_address_line3    = EXCLUDED.contact_address_line3,
+            contact_city             = EXCLUDED.contact_city,
+            contact_country          = EXCLUDED.contact_country,
+            contact_state            = EXCLUDED.contact_state,
+            contact_zip              = EXCLUDED.contact_zip,
+            contact_phone            = EXCLUDED.contact_phone,
+            contact_email            = EXCLUDED.contact_email,
             bank_name                = EXCLUDED.bank_name,
             bank_branch              = EXCLUDED.bank_branch,
             swift_code               = EXCLUDED.swift_code,
             transit_code             = EXCLUDED.transit_code,
             bank_address             = EXCLUDED.bank_address,
+            bank_city                = EXCLUDED.bank_city,
+            bank_country             = EXCLUDED.bank_country,
+            bank_state               = EXCLUDED.bank_state,
+            bank_zip                 = EXCLUDED.bank_zip,
             account_type             = EXCLUDED.account_type,
             currency                 = EXCLUDED.currency,
             aba_routing_encrypted    = EXCLUDED.aba_routing_encrypted,
@@ -652,15 +764,30 @@ router.put('/payment', authenticate, authorize('provider'), async (req, res) => 
             account_ownership     = $2,
             business_name         = $3,
             payee_first_name      = $4,
-            payee_surname         = $5,
-            bank_name             = $6,
-            bank_branch           = $7,
-            swift_code            = $8,
-            transit_code          = $9,
-            bank_address          = $10,
-            account_type          = $11,
-            currency              = $12,
-            aba_routing_encrypted = $13,
+            middle_initial        = $5,
+            payee_surname         = $6,
+            recipient_id          = $7,
+            contact_address_line1 = $8,
+            contact_address_line2 = $9,
+            contact_address_line3 = $10,
+            contact_city          = $11,
+            contact_country       = $12,
+            contact_state         = $13,
+            contact_zip           = $14,
+            contact_phone         = $15,
+            contact_email         = $16,
+            bank_name             = $17,
+            bank_branch           = $18,
+            swift_code            = $19,
+            transit_code          = $20,
+            bank_address          = $21,
+            bank_city             = $22,
+            bank_country          = $23,
+            bank_state            = $24,
+            bank_zip              = $25,
+            account_type          = $26,
+            currency              = $27,
+            aba_routing_encrypted = $28,
             updated_at            = NOW()
           WHERE provider_id = $1`,
         commonParams

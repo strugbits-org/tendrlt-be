@@ -6,9 +6,11 @@ const { notifyUser, notifyChannel } = require('../lib/realtimeService');
 const { sendNewQuoteEmail, sendQuoteAcceptedEmail } = require('../lib/quoteEmails');
 const { sendPushToUser } = require('../lib/pushService');
 const { detectPII } = require('../lib/piiFilter');
+const { aiCheckMessage } = require('../lib/aiModeration');
 const supabase = require('../lib/supabaseClient');
 const { signedUrlMap } = require('../lib/storageUrls');
 const { getActiveRates, getMinFees } = require('../lib/feeConfig');
+const { createPaymentRequest } = require('../lib/wipay');
 
 const router = express.Router();
 
@@ -205,22 +207,21 @@ router.get('/received', authenticate, authorize('homeowner'), async (req, res) =
 // Homeowner accepts a quote; all other quotes on the same tender
 // are set to 'rejected'.
 // ============================================================
+// PATCH /api/quotes/:id/accept — initiates WiPay checkout (does NOT finalize
+// acceptance). The quote is only actually accepted once WiPay confirms
+// payment via the response_url callback in routes/payments.js. See
+// documentation/PAYMENTS_AND_JOB_WORKFLOW.md.
 router.patch('/:id/accept', authenticate, authorize('homeowner'), async (req, res) => {
   const { id } = req.params;
   try {
-    // Superuser query (bypasses RLS) so we can read the winning provider's
-    // contact + the quote amount + service name in one shot.
+    // Superuser query (bypasses RLS) so we can read the quote/tender/rate info
+    // needed to price this checkout in one shot.
     const check = await db.query(`
       SELECT q.id, q.tender_id, q.provider_id, q.amount, q.status AS quote_status,
              q.provider_fee_rate,
-             t.client_id, t.client_fee_rate,
-             st.display_name AS service_name,
-             pr.email AS provider_email,
-             (pr.first_name || ' ' || pr.last_name) AS provider_name
+             t.client_id, t.client_fee_rate
       FROM public.quotes q
       JOIN public.tenders t ON t.id = q.tender_id
-      LEFT JOIN public.service_types st ON st.id = t.service_type_id
-      JOIN public.users pr ON pr.id = q.provider_id
       WHERE q.id = $1
     `, [id]);
 
@@ -231,27 +232,15 @@ router.patch('/:id/accept', authenticate, authorize('homeowner'), async (req, re
     if (row.client_id !== req.user.id) {
       return res.status(403).json({ success: false, message: 'Forbidden.' });
     }
+    if (row.quote_status !== 'pending') {
+      return res.status(400).json({ success: false, message: 'This quote is no longer available.' });
+    }
 
-    // Reject every other quote on the tender; capture the losing providers so we
-    // can push them a realtime event (their "My Quotes" flips to "Not selected").
-    const rejected = await db.query(
-      `UPDATE public.quotes SET status = 'rejected', updated_at = NOW()
-       WHERE tender_id = $1 AND id != $2 RETURNING id, provider_id`,
-      [row.tender_id, id]
-    );
-    await db.query(
-      `UPDATE public.quotes SET status = 'accepted', updated_at = NOW() WHERE id = $1`,
-      [id]
-    );
-
-    // ── Real-world workflow starts here (WiPay deferred) ──────────────────
-    // 1. Record a real transaction so payment/revenue numbers become live.
-    //    No money moves yet — status 'held' (escrow-held) until WiPay exists.
-    //    Fees are LOCKED at creation time: the client rate snapshotted on the
-    //    tender when it was posted, and the provider rate snapshotted on the
-    //    quote when it was submitted. A later fee change never re-prices this
-    //    job. Fall back to the live config only for pre-snapshot (legacy) rows.
-    //    See documentation/PAYMENTS_AND_JOB_WORKFLOW.md.
+    // Fees are LOCKED at checkout time: the client rate snapshotted on the
+    // tender when it was posted, and the provider rate snapshotted on the
+    // quote when it was submitted. A later fee change never re-prices this
+    // job. Fall back to the live config only for pre-snapshot (legacy) rows.
+    // See documentation/PAYMENTS_AND_JOB_WORKFLOW.md.
     let clientRate   = row.client_fee_rate   != null ? parseFloat(row.client_fee_rate)   : null;
     let providerRate = row.provider_fee_rate != null ? parseFloat(row.provider_fee_rate) : null;
     if (clientRate == null || providerRate == null) {
@@ -263,8 +252,7 @@ router.patch('/:id/accept', authenticate, authorize('homeowner'), async (req, re
     let clientFee      = Math.round((amount * clientRate) / 100);
     let providerFee    = Math.round((amount * providerRate) / 100);
     // Minimum-fee floor (guardrail on low-value jobs): if the % fee falls below
-    // the configured minimum, charge the minimum instead. Applied from the
-    // current active config at accept time. See PAYMENTS_AND_JOB_WORKFLOW.md.
+    // the configured minimum, charge the minimum instead.
     const minFees = await getMinFees();
     if (minFees.enabled) {
       clientFee = Math.max(clientFee, minFees.minClientFee);
@@ -273,65 +261,47 @@ router.patch('/:id/accept', authenticate, authorize('homeowner'), async (req, re
     }
     const providerPayout = amount - providerFee;
     const platformFee    = clientFee + providerFee;
+    const totalCents     = amount + clientFee; // what the homeowner is actually charged
 
-    await db.query(
+    // WiPay order_id: must be alphanumeric+dash, begin/end alphanumeric, ≤48
+    // chars. Includes a timestamp so a retry after a failed attempt gets a
+    // fresh, distinct order_id rather than reusing one WiPay may have seen.
+    const orderId = `${id}-${Math.floor(Date.now() / 1000)}`;
+
+    // Upsert (not insert) — a homeowner can retry checkout after a failed
+    // payment attempt. The WHERE guards against clobbering an already
+    // held/completed transaction if this is somehow called again.
+    const upserted = await db.query(
       `INSERT INTO public.transactions
          (quote_id, tender_id, client_id, provider_id, amount,
           client_fee, provider_fee, client_fee_rate, provider_fee_rate,
-          platform_fee, provider_payout, status, collected_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'held',NOW())
-       ON CONFLICT (quote_id) DO NOTHING`,
+          platform_fee, provider_payout, status, wipay_order_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'awaiting_payment',$12)
+       ON CONFLICT (quote_id) DO UPDATE SET
+         wipay_order_id = EXCLUDED.wipay_order_id,
+         status         = 'awaiting_payment',
+         updated_at     = NOW()
+       WHERE public.transactions.status IN ('awaiting_payment', 'payment_failed')
+       RETURNING id`,
       [id, row.tender_id, row.client_id, row.provider_id, amount,
        clientFee, providerFee, clientRate, providerRate,
-       platformFee, providerPayout]
+       platformFee, providerPayout, orderId]
     );
 
-    // 2. Move the tender into the active/in-progress workflow. This also hides
-    //    it from other providers' browse (which filters status = 'open').
-    await db.query(
-      `UPDATE public.tenders SET status = 'in_progress', updated_at = NOW() WHERE id = $1`,
-      [row.tender_id]
-    );
+    if (upserted.rows.length === 0) {
+      return res.status(400).json({ success: false, message: 'This quote has already been accepted.' });
+    }
 
-    res.json({ success: true });
-
-    // ── Fire-and-forget fan-out ───────────────────────────────────────────
-    const serviceName = row.service_name || 'your job';
-    const winnerTitle  = 'Your quote was accepted 🎉';
-    const winnerBody   = `${serviceName} — the job is starting. Open the tender for the homeowner's contact details & location.`;
-
-    Promise.allSettled([
-      // Winner realtime event (existing behaviour — drives toast + My Quotes).
-      notifyUser(row.provider_id, 'quote-accepted', { quoteId: id, tenderId: row.tender_id }),
-      // Winner persistent bell notification.
-      db.query(`
-        INSERT INTO public.notifications (user_id, type, title, body, data)
-        VALUES ($1, 'quote_accepted', $2, $3, $4::jsonb)
-      `, [row.provider_id, winnerTitle, winnerBody, JSON.stringify({ tenderId: row.tender_id })]),
-      // Winner email.
-      sendQuoteAcceptedEmail(row.provider_email, {
-        providerName: row.provider_name || 'there',
-        tenderTitle: serviceName,
-        amount,
-      }),
-      // Winner web push → deep-links to the tender detail (SW 'view_job' action).
-      sendPushToUser(row.provider_id, {
-        title: winnerTitle,
-        body: winnerBody,
-        type: 'quote_accepted',
-        url: `/tender/${row.tender_id}`,
-        data: { tender_id: row.tender_id },
-      }),
-      // Losing providers: realtime only (no email/push/bell, per product decision).
-      ...rejected.rows.map((r) =>
-        notifyUser(r.provider_id, 'quote-rejected', { quoteId: r.id, tenderId: row.tender_id })
-      ),
-    ]).catch((err) => {
-      console.warn('PATCH /api/quotes/:id/accept — side-effect error:', err.message);
+    const { url } = await createPaymentRequest({
+      total: totalCents / 100,
+      orderId,
+      responseUrl: `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/payments/wipay/callback`,
     });
+
+    res.json({ success: true, url });
   } catch (err) {
     console.error('PATCH /api/quotes/:id/accept error:', err);
-    res.status(500).json({ success: false, message: 'Failed to accept quote.' });
+    res.status(502).json({ success: false, message: 'Could not start payment. Please try again shortly.' });
   }
 });
 
@@ -609,7 +579,7 @@ router.post('/:id/messages', authenticate, async (req, res) => {
     return res.status(400).json({ success: false, message: 'Message is too long (max 2000 characters).' });
   }
 
-  // Server-authoritative PII / off-platform block.
+  // Server-authoritative PII / off-platform block (Layers 1-2 — regex).
   const pii = detectPII(body);
   if (pii.blocked) {
     return res.status(422).json({
@@ -617,6 +587,18 @@ router.post('/:id/messages', authenticate, async (req, res) => {
       code: 'PII_BLOCKED',
       label: pii.label,
       message: `For your safety, sharing a ${pii.label} is not allowed. Keep the conversation on TendrIt.`,
+    });
+  }
+
+  // Layer 3 — AI fallback for disguised attempts regex can't pattern-match.
+  // Only runs on messages that already passed the regex check above.
+  const aiCheck = await aiCheckMessage(body);
+  if (aiCheck.blocked) {
+    return res.status(422).json({
+      success: false,
+      code: 'PII_BLOCKED',
+      label: 'restricted content',
+      message: 'This message is not allowed. For your safety, all conversation must stay on TendrIt.',
     });
   }
 
