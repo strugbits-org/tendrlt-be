@@ -1,18 +1,19 @@
 const db = require('../db');
 
 /**
- * Gate a route on BOTH independent provider verification signals — neither
- * alone is enough:
- *   - verification_status = 'approved'  (existing admin manual document review)
- *   - didit_status        = 'approved'  (automated Didit ID + liveness + face-match check)
+ * Gate a route on admin approval — the ONLY thing that unlocks quoting is
+ * verification_status = 'approved' (the admin's manual decision).
  *
- * See DIDIT_VERIFICATION_PLAN.md for why these are two separate columns
- * rather than one combined flag. Must run after `authenticate` (needs req.user.id).
+ * didit_status is informational only: it surfaces automated ID/liveness/
+ * face-match signals on the admin Verification tab to help the admin decide,
+ * but it is not an independent gate — an admin can approve a provider
+ * regardless of what Didit says. Must run after `authenticate` (needs
+ * req.user.id).
  */
 async function requireIdentityVerified(req, res, next) {
   try {
     const result = await db.queryAsUser(req.user.id, `
-      SELECT verification_status, didit_status
+      SELECT verification_status
       FROM public.provider_profiles
       WHERE provider_id = $1
     `, [req.user.id]);

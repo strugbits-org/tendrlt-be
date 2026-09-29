@@ -1,5 +1,15 @@
 # Didit identity verification for provider onboarding
 
+> **Superseded (2026-09-28):** the "AND" gating rule below (`verification_status`
+> AND `didit_status` both required to quote) was implemented but is **not**
+> the actual business rule. Confirmed correction: only admin approval
+> (`verification_status = 'approved'`) gates quoting. `didit_status` is
+> informational only — it surfaces automated ID/liveness/face-match signals
+> on the admin Verification tab to help the admin decide, but an admin can
+> approve a provider regardless of what Didit says. `middleware/verification.js`
+> has been corrected to match. The rest of this doc (session flow, webhook,
+> schema, UI) is otherwise still accurate.
+
 ## Context
 
 We found that `POST /api/quotes` only checks `role === 'provider'` — there is no

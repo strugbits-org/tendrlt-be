@@ -9,10 +9,15 @@ const db = require('../db');
 const { authenticate } = require('../middleware/auth');
 const { requireTurnstile } = require('../lib/turnstile');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error('JWT_SECRET environment variable is required.');
+}
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:5000';
+
+const ALLOWED_SIGNUP_ROLES = ['homeowner', 'provider'];
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -154,8 +159,7 @@ router.post('/register', requireTurnstile, async (req, res) => {
     return res.status(400).json({ success: false, message: 'Please fill in all required fields.' });
   }
 
-  const allowedRoles = ['homeowner', 'provider'];
-  if (!allowedRoles.includes(role)) {
+  if (!ALLOWED_SIGNUP_ROLES.includes(role)) {
     return res.status(400).json({ success: false, message: 'Invalid user role selected.' });
   }
 
@@ -389,7 +393,7 @@ router.post('/login', requireTurnstile, async (req, res) => {
  * Redirect user to Google OAuth consent screen
  */
 router.get('/google', (req, res) => {
-  const role = req.query.role || 'homeowner';
+  const role = ALLOWED_SIGNUP_ROLES.includes(req.query.role) ? req.query.role : 'homeowner';
 
   const rootUrl = 'https://accounts.google.com/o/oauth2/v2/auth';
   const options = {
@@ -416,7 +420,7 @@ router.get('/google', (req, res) => {
 router.get('/google/callback', async (req, res) => {
   const code = req.query.code;
   const state = req.query.state ? JSON.parse(req.query.state) : { role: 'homeowner' };
-  const roleFromState = state.role || 'homeowner';
+  const roleFromState = ALLOWED_SIGNUP_ROLES.includes(state.role) ? state.role : 'homeowner';
 
   if (!code) {
     return res.redirect(`${FRONTEND_URL}/auth?error=google_auth_failed`);
@@ -520,8 +524,7 @@ router.post('/complete-profile', authenticate, async (req, res) => {
     return res.status(400).json({ success: false, message: 'Phone number, parish, and role are required.' });
   }
 
-  const allowedRoles = ['homeowner', 'provider'];
-  if (!allowedRoles.includes(role)) {
+  if (!ALLOWED_SIGNUP_ROLES.includes(role)) {
     return res.status(400).json({ success: false, message: 'Invalid role selected.' });
   }
 

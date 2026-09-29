@@ -7,7 +7,7 @@ const { authenticate, authorize } = require('../middleware/auth');
 const { notifyChannel } = require('../lib/realtimeService');
 const { sendNewProviderSubmittedEmail } = require('../lib/verificationEmails');
 const paymentCrypto = require('../lib/paymentCrypto');
-const { createVerificationSession } = require('../lib/didit');
+const { createVerificationSession, getSessionDecision, mapDiditStatus, extractCheckSummary } = require('../lib/didit');
 
 const router = express.Router();
 
@@ -101,6 +101,56 @@ router.post('/verification/session', authenticate, authorize('provider'), async 
   } catch (err) {
     console.error('POST /api/providers/verification/session error:', err);
     res.status(500).json({ success: false, message: 'Failed to start identity verification.' });
+  }
+});
+
+// ============================================================
+// POST /api/providers/verification/refresh
+// "Refresh status" on the onboarding page. GET /me only reflects whatever the
+// Didit webhook has already written to our DB — if that webhook never lands
+// (unreachable backend URL, dropped delivery, etc.) the stored didit_status
+// is stuck on 'pending' forever and refreshing never helps. This instead
+// polls Didit directly for the session's current decision and writes it,
+// so refresh can recover even when the webhook never arrived.
+// ============================================================
+router.post('/verification/refresh', authenticate, authorize('provider'), async (req, res) => {
+  try {
+    const result = await db.queryAsUser(req.user.id,
+      `SELECT didit_session_id, didit_status FROM public.provider_profiles WHERE provider_id = $1`,
+      [req.user.id]
+    );
+    const row = result.rows[0];
+    const sessionId = row?.didit_session_id;
+
+    if (!sessionId) {
+      return res.json({ success: true, diditStatus: row?.didit_status || 'not_started' });
+    }
+
+    const decision = await getSessionDecision(sessionId);
+    const diditStatus = mapDiditStatus(decision?.status);
+
+    if (!diditStatus) {
+      // Still non-terminal at Didit (e.g. in progress) — nothing new to write.
+      return res.json({ success: true, diditStatus: row?.didit_status || 'pending' });
+    }
+
+    const { documentType, checkSummary } = extractCheckSummary(decision);
+
+    await db.queryAsUser(req.user.id,
+      `UPDATE public.provider_profiles
+         SET didit_status        = $1,
+             didit_check_summary = $2::jsonb,
+             didit_document_type = $3,
+             didit_verified_at   = CASE WHEN $1 = 'approved' THEN NOW() ELSE didit_verified_at END,
+             didit_updated_at    = NOW()
+       WHERE provider_id = $4`,
+      [diditStatus, JSON.stringify(checkSummary), documentType, req.user.id]
+    );
+
+    res.json({ success: true, diditStatus });
+  } catch (err) {
+    console.error('POST /api/providers/verification/refresh error:', err);
+    res.status(500).json({ success: false, message: 'Failed to refresh verification status.' });
   }
 });
 
@@ -355,6 +405,13 @@ router.delete('/upload/portfolio', authenticate, authorize('provider'), async (r
   const { path: filePath } = req.body;
   if (!filePath) {
     return res.status(400).json({ success: false, message: 'path is required.' });
+  }
+
+  // Portfolio paths are namespaced as `${providerId}/portfolio/...` — reject
+  // anything outside the caller's own namespace so one provider can't delete
+  // another provider's file from storage.
+  if (!filePath.startsWith(`${req.user.id}/`)) {
+    return res.status(403).json({ success: false, message: 'You do not have permission to delete this file.' });
   }
 
   const { error: deleteError } = await supabase.storage

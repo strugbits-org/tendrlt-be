@@ -1,6 +1,11 @@
 const jwt = require('jsonwebtoken');
 const db = require('../db');
 
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error('JWT_SECRET environment variable is required.');
+}
+
 /**
  * Protect routes: Authenticates request and sets req.user.
  * Uses db.query (superuser, bypasses RLS) for the session lookup —
@@ -24,7 +29,7 @@ async function authenticate(req, res, next) {
   // Step 1: verify the JWT signature — pure CPU, no DB involved
   let decoded;
   try {
-    decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret');
+    decoded = jwt.verify(token, JWT_SECRET);
   } catch (jwtErr) {
     return res.status(401).json({ success: false, message: 'Invalid or expired session token.' });
   }
