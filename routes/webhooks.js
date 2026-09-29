@@ -1,21 +1,10 @@
 const express = require('express');
 const db = require('../db');
-const { verifyWebhookSignature } = require('../lib/didit');
+const { verifyWebhookSignature, mapDiditStatus, extractCheckSummary } = require('../lib/didit');
+const { verifyResponseHash, verifyWebhookSignature: verifyWipaySignature } = require('../lib/wipay');
+const { finalizeAcceptedQuote, markPaymentFailed } = require('../lib/quotePayments');
 
 const router = express.Router();
-
-// Didit session statuses → our didit_status. Anything not listed here is a
-// non-terminal state (Not Started, In Progress, Awaiting User) — acknowledged
-// but not persisted, since there's nothing new to record yet.
-const DIDIT_STATUS_MAP = {
-  Approved:      'approved',
-  Declined:      'declined',
-  'In Review':   'pending',
-  Resubmitted:   'pending',
-  Abandoned:     'declined',
-  Expired:       'declined',
-  'Kyc Expired': 'declined',
-};
 
 // ============================================================
 // POST /api/webhooks/didit
@@ -53,7 +42,7 @@ router.post('/didit', express.raw({ type: 'application/json' }), async (req, res
     return res.status(400).json({ success: false, message: 'Missing required fields.' });
   }
 
-  const diditStatus = DIDIT_STATUS_MAP[status];
+  const diditStatus = mapDiditStatus(status);
   if (!diditStatus) {
     // Non-terminal status update — nothing to persist yet.
     console.log(`[didit webhook] status="${status}" is non-terminal — acknowledged, no DB write`);
@@ -66,25 +55,7 @@ router.post('/didit', express.raw({ type: 'application/json' }), async (req, res
   // deliberately left unread here. `warnings[].risk` codes and the
   // ip_analyses booleans below are failure-reason / fraud-signal metadata,
   // not PII, so those are worth keeping. See DIDIT_VERIFICATION_PLAN.md.
-  const idVerification = decision?.id_verifications?.[0];
-  const livenessCheck  = decision?.liveness_checks?.[0];
-  const faceMatch      = decision?.face_matches?.[0];
-  const ipAnalyses     = decision?.ip_analyses ?? [];
-
-  const checkSummary = {
-    document_authentic:          idVerification?.status === 'Approved',
-    document_declined_reasons:   (idVerification?.warnings ?? []).map(w => w.risk),
-    liveness_status:             livenessCheck?.status === 'Approved',
-    liveness_score:              livenessCheck?.score ?? null,
-    face_match_status:           faceMatch?.status === 'Approved',
-    face_match_score:            faceMatch?.score ?? null,
-    face_match_declined_reasons: (faceMatch?.warnings ?? []).map(w => w.risk),
-    ip_country_mismatch: ipAnalyses.some(ip =>
-      ip.warnings?.some(w => w.risk === 'COUNTRY_FROM_DOCUMENT_DOES_NOT_MATCH_COUNTRY_FROM_IP')
-    ),
-    ip_is_vpn_or_tor: ipAnalyses.some(ip => ip.is_vpn_or_tor === true),
-  };
-  const documentType = idVerification?.document_type ?? null;
+  const { documentType, checkSummary } = extractCheckSummary(decision);
 
   console.log(
     `[didit webhook] writing provider=${providerId} didit_status=${diditStatus} ` +
@@ -122,6 +93,82 @@ router.post('/didit', express.raw({ type: 'application/json' }), async (req, res
   } catch (err) {
     console.error(`[didit webhook] DB update failed for provider=${providerId} session=${sessionId}:`, err);
     res.status(500).json({ success: false });
+  }
+});
+
+// ============================================================
+// POST /api/webhooks/wipay
+// Server-to-server backstop for the browser-redirect confirmation in
+// routes/payments.js. Signature verification uses the Standard Webhooks/
+// Svix scheme (see lib/wipay.js#verifyWebhookSignature) — a well-founded
+// guess based on the `whsec_` secret prefix, not documented by WiPay, so
+// this is ALSO backed by the classic API's own documented hash fields
+// (transaction_id + total + api_key) as a second, independent check before
+// finalizing a payment.success event — belt and suspenders while the
+// envelope scheme is unconfirmed against a real delivery.
+//
+// Payload field names are defensive/best-guess (event name + a data/payload
+// object) since we've only seen the event catalog in the dashboard UI, not
+// a payload spec. First real delivery should be inspected (this logs the
+// full body) and this handler tightened up once the actual shape is known.
+// ============================================================
+router.post('/wipay', express.raw({ type: 'application/json' }), async (req, res) => {
+  const rawBody = req.body; // Buffer
+  console.log(`[wipay webhook] received — ${rawBody?.length ?? 0} bytes`);
+
+  if (!verifyWipaySignature(rawBody, req.headers)) {
+    console.warn('[wipay webhook] rejected — signature verification failed (401)');
+    return res.status(401).json({ success: false, message: 'Invalid signature.' });
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(rawBody.toString('utf8'));
+  } catch (err) {
+    console.error('[wipay webhook] rejected — body is not valid JSON:', err.message);
+    return res.status(400).json({ success: false, message: 'Invalid JSON.' });
+  }
+
+  console.log('[wipay webhook] payload:', JSON.stringify(payload));
+
+  const eventType = payload.event || payload.type || payload.event_type;
+  const data = payload.data || payload.payload || payload;
+  const orderId = data.order_id || data.orderId;
+  const transactionId = data.transaction_id || data.transactionId;
+  const total = data.total;
+  const hash = data.hash;
+
+  if (!eventType || !orderId) {
+    console.warn('[wipay webhook] missing event type or order_id — acknowledged, no action taken');
+    return res.status(200).json({ success: true });
+  }
+
+  try {
+    if (eventType === 'payment.success') {
+      // Signature is already verified above. The classic hash fields are an
+      // extra check when present, but not required to trust this event now
+      // that the envelope itself is signature-verified.
+      if (hash && !verifyResponseHash({ transactionId, total, hash })) {
+        console.error(`[wipay webhook] payment.success for order_id=${orderId} — hash present but INVALID, refusing to finalize`);
+        return res.status(200).json({ success: true });
+      }
+      const outcome = await finalizeAcceptedQuote(orderId);
+      console.log(`[wipay webhook] payment.success order_id=${orderId} → ${outcome.ok ? (outcome.alreadyDone ? 'already finalized' : 'finalized') : outcome.reason}`);
+    } else if (eventType === 'payment.failed' || eventType === 'payment.error') {
+      const quoteId = await markPaymentFailed(orderId, { transactionId, message: eventType });
+      console.log(`[wipay webhook] ${eventType} order_id=${orderId} quote=${quoteId ?? 'not found'}`);
+    } else {
+      // Chargebacks/refunds — dispute/refund handling isn't built yet.
+      // Logged loudly so these are never silently lost; needs manual
+      // follow-up until a proper handler exists.
+      console.warn(`[wipay webhook] unhandled event "${eventType}" for order_id=${orderId} — needs manual follow-up`);
+    }
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error(`[wipay webhook] processing failed for order_id=${orderId}:`, err);
+    // Still 200 — WiPay would otherwise retry indefinitely on a bug we need
+    // to fix server-side, not on their end.
+    res.status(200).json({ success: false });
   }
 });
 

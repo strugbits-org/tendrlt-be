@@ -16,6 +16,8 @@ const contactRoutes       = require('./routes/contact');
 const feedbackRoutes      = require('./routes/feedback');
 const feesRoutes          = require('./routes/fees');
 const webhooksRoutes      = require('./routes/webhooks');
+const chatRoutes          = require('./routes/chat');
+const paymentsRoutes      = require('./routes/payments');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -52,6 +54,8 @@ app.use('/api/push',          pushRoutes);
 app.use('/api/contact',       contactRoutes);
 app.use('/api/feedback',      feedbackRoutes);
 app.use('/api/fees',          feesRoutes);
+app.use('/api/chat',          chatRoutes);
+app.use('/api/payments',      paymentsRoutes);
 
 // Health check endpoint
 app.get('/health', (req, res) => {

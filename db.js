@@ -14,7 +14,7 @@ const pool = new Pool({
     : false,
   max: 10,                     // stay under Supabase free-tier connection limit (25)
   idleTimeoutMillis: 30000,    // keep idle connections alive 30s
-  connectionTimeoutMillis: 10000, // 10s — Supabase free tier can be slow on cold starts
+  connectionTimeoutMillis: 30000, // 30s — the network path to this Supabase region has been observed taking 7-10s+ to complete a handshake even when healthy, so 10s was killing borderline-slow (but otherwise fine) connections
 });
 
 pool.on('error', (err) => {
