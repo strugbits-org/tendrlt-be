@@ -1678,4 +1678,134 @@ router.get('/analytics/supply-demand', async (req, res) => {
   }
 });
 
+// ============================================================
+// Chatbot content management — "Ask TendrIt Anything" homepage assistant.
+// Read publicly (unauthenticated) by routes/chat.js; writable only here,
+// under the admin-only router.use() guard at the top of this file.
+// ============================================================
+
+// GET /api/admin/chatbot/settings
+router.get('/chatbot/settings', async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT company_name, tagline, about, policies, extra_notes, updated_at
+         FROM public.chatbot_settings WHERE id = 1`
+    );
+    res.json({ success: true, settings: result.rows[0] || null });
+  } catch (err) {
+    console.error('GET /api/admin/chatbot/settings error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load chatbot settings.' });
+  }
+});
+
+// PUT /api/admin/chatbot/settings
+router.put('/chatbot/settings', async (req, res) => {
+  const { company_name, tagline, about, policies, extra_notes } = req.body;
+  try {
+    const result = await db.query(
+      `UPDATE public.chatbot_settings SET
+         company_name = COALESCE($1, company_name),
+         tagline      = $2,
+         about        = $3,
+         policies     = $4,
+         extra_notes  = $5,
+         updated_at   = NOW()
+       WHERE id = 1
+       RETURNING company_name, tagline, about, policies, extra_notes, updated_at`,
+      [
+        company_name ? String(company_name).trim() : null,
+        tagline ? String(tagline).trim() : null,
+        about ? String(about).trim() : null,
+        policies ? String(policies).trim() : null,
+        extra_notes ? String(extra_notes).trim() : null,
+      ]
+    );
+    res.json({ success: true, settings: result.rows[0] });
+  } catch (err) {
+    console.error('PUT /api/admin/chatbot/settings error:', err);
+    res.status(500).json({ success: false, message: 'Failed to save chatbot settings.' });
+  }
+});
+
+// GET /api/admin/chatbot/faqs
+router.get('/chatbot/faqs', async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, question, answer, display_order, is_active, created_at, updated_at
+         FROM public.chatbot_faqs ORDER BY display_order ASC, created_at ASC`
+    );
+    res.json({ success: true, faqs: result.rows });
+  } catch (err) {
+    console.error('GET /api/admin/chatbot/faqs error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load FAQs.' });
+  }
+});
+
+// POST /api/admin/chatbot/faqs   body: { question, answer, display_order? }
+router.post('/chatbot/faqs', async (req, res) => {
+  const { question, answer, display_order } = req.body;
+  if (!question || !String(question).trim() || !answer || !String(answer).trim()) {
+    return res.status(400).json({ success: false, message: 'Question and answer are required.' });
+  }
+  try {
+    const result = await db.query(
+      `INSERT INTO public.chatbot_faqs (question, answer, display_order)
+       VALUES ($1, $2, $3)
+       RETURNING id, question, answer, display_order, is_active, created_at, updated_at`,
+      [String(question).trim(), String(answer).trim(), Number.isFinite(display_order) ? display_order : 0]
+    );
+    res.status(201).json({ success: true, faq: result.rows[0] });
+  } catch (err) {
+    console.error('POST /api/admin/chatbot/faqs error:', err);
+    res.status(500).json({ success: false, message: 'Failed to create FAQ.' });
+  }
+});
+
+// PUT /api/admin/chatbot/faqs/:id   body: { question?, answer?, display_order?, is_active? }
+router.put('/chatbot/faqs/:id', async (req, res) => {
+  const { id } = req.params;
+  const { question, answer, display_order, is_active } = req.body;
+  try {
+    const result = await db.query(
+      `UPDATE public.chatbot_faqs SET
+         question      = COALESCE($1, question),
+         answer        = COALESCE($2, answer),
+         display_order = COALESCE($3, display_order),
+         is_active     = COALESCE($4, is_active),
+         updated_at    = NOW()
+       WHERE id = $5
+       RETURNING id, question, answer, display_order, is_active, created_at, updated_at`,
+      [
+        question != null ? String(question).trim() : null,
+        answer != null ? String(answer).trim() : null,
+        Number.isFinite(display_order) ? display_order : null,
+        typeof is_active === 'boolean' ? is_active : null,
+        id,
+      ]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'FAQ not found.' });
+    }
+    res.json({ success: true, faq: result.rows[0] });
+  } catch (err) {
+    console.error('PUT /api/admin/chatbot/faqs/:id error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update FAQ.' });
+  }
+});
+
+// DELETE /api/admin/chatbot/faqs/:id
+router.delete('/chatbot/faqs/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await db.query('DELETE FROM public.chatbot_faqs WHERE id = $1', [id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, message: 'FAQ not found.' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /api/admin/chatbot/faqs/:id error:', err);
+    res.status(500).json({ success: false, message: 'Failed to delete FAQ.' });
+  }
+});
+
 module.exports = router;
