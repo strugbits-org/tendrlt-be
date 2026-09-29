@@ -486,8 +486,11 @@ router.get('/stats', authenticate, authorize('provider'), async (req, res) => {
 
 // ============================================================
 // GET /api/providers/earnings
-// Real earnings for the provider, sourced from public.transactions
-// (created when a homeowner accepts a quote — WiPay deferred, status 'held').
+// Real earnings for the provider, sourced from public.transactions. A row
+// now exists from the moment checkout is INITIATED (status 'awaiting_payment'),
+// not just once paid — both queries below explicitly exclude
+// 'awaiting_payment'/'payment_failed' so an unpaid/abandoned checkout never
+// shows up as earned revenue or a "job won".
 // All amounts are JMD cents. Uses the superuser pool so we can join the
 // homeowner's (masked) name; strictly filtered by provider_id = the caller.
 // See documentation/PAYMENTS_AND_JOB_WORKFLOW.md.
@@ -520,6 +523,7 @@ router.get('/earnings', authenticate, authorize('provider'), async (req, res) =>
         COUNT(*)::int                          AS jobs_all
       FROM public.transactions
       WHERE provider_id = $1
+        AND status NOT IN ('awaiting_payment', 'payment_failed')
     `, [uid]);
 
     const txns = await db.query(`
@@ -532,6 +536,7 @@ router.get('/earnings', authenticate, authorize('provider'), async (req, res) =>
       LEFT JOIN public.service_types st ON st.id = t.service_type_id
       JOIN public.users cu ON cu.id = tx.client_id
       WHERE tx.provider_id = $1
+        AND tx.status NOT IN ('awaiting_payment', 'payment_failed')
       ORDER BY tx.created_at DESC
       LIMIT 50
     `, [uid]);

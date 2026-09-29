@@ -42,6 +42,13 @@ const query = (text, params) => pool.query(text, params);
  */
 const queryAsUser = async (userId, text, params) => {
   const client = await pool.connect();
+  // pool.on('error') above only covers IDLE clients sitting in the pool —
+  // a client actively checked out via pool.connect() needs its own listener,
+  // or a mid-use connection drop (e.g. a network blip) is an unhandled
+  // 'error' event that crashes the entire Node process, not just this request.
+  client.on('error', (err) => {
+    console.error('Checked-out client error (queryAsUser):', err.message);
+  });
   try {
     // One round trip: BEGIN + both SET LOCAL in a single simple query
     await client.query(
@@ -51,7 +58,11 @@ const queryAsUser = async (userId, text, params) => {
     await client.query('COMMIT');
     return result;
   } catch (err) {
-    await client.query('ROLLBACK');
+    // The connection may already be dead (that's often why we're here) —
+    // don't let a failed ROLLBACK mask the original error.
+    try { await client.query('ROLLBACK'); } catch (rollbackErr) {
+      console.error('ROLLBACK failed (queryAsUser):', rollbackErr.message);
+    }
     throw err;
   } finally {
     client.release();
@@ -69,6 +80,9 @@ const queryAsUser = async (userId, text, params) => {
  */
 const queryAsUserBatch = async (userId, queries) => {
   const client = await pool.connect();
+  client.on('error', (err) => {
+    console.error('Checked-out client error (queryAsUserBatch):', err.message);
+  });
   try {
     await client.query(
       `BEGIN; SET LOCAL ROLE tendrit_app; SET LOCAL "app.current_user_id" = '${userId}'`
@@ -80,7 +94,9 @@ const queryAsUserBatch = async (userId, queries) => {
     await client.query('COMMIT');
     return results;
   } catch (err) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch (rollbackErr) {
+      console.error('ROLLBACK failed (queryAsUserBatch):', rollbackErr.message);
+    }
     throw err;
   } finally {
     client.release();

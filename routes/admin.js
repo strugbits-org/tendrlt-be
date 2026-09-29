@@ -1178,10 +1178,13 @@ router.get('/revenue', async (req, res) => {
              COALESCE(SUM(provider_fee),0)::bigint AS pfee,
              COALESCE(SUM(platform_fee),0)::bigint AS rev,
              COUNT(*)::int                          AS done
-      FROM public.transactions`;
+      FROM public.transactions
+      -- A row exists from the moment checkout is INITIATED, not just once
+      -- paid — exclude unpaid/abandoned attempts from platform revenue.
+      WHERE status NOT IN ('awaiting_payment', 'payment_failed')`;
 
     const current = await db.query(
-      `${sums} WHERE ($1::int IS NULL OR created_at >= NOW() - (INTERVAL '1 day' * $1))`,
+      `${sums} AND ($1::int IS NULL OR created_at >= NOW() - (INTERVAL '1 day' * $1))`,
       [days]
     );
     const c = current.rows[0];
@@ -1190,7 +1193,7 @@ router.get('/revenue', async (req, res) => {
     let deltaRev = '—';
     if (days !== null) {
       const prev = await db.query(
-        `${sums} WHERE created_at >= NOW() - (INTERVAL '1 day' * $1 * 2)
+        `${sums} AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2)
                    AND created_at <  NOW() - (INTERVAL '1 day' * $1)`,
         [days]
       );
@@ -1347,7 +1350,8 @@ router.get('/disputes', async (req, res) => {
 
     // Dispute rate needs the denominator: total accepted (transacted) jobs.
     const totals = await db.query(
-      `SELECT COUNT(*)::int AS transacted FROM public.transactions`
+      `SELECT COUNT(*)::int AS transacted FROM public.transactions
+        WHERE status NOT IN ('awaiting_payment', 'payment_failed')`
     );
 
     res.json({
@@ -1496,7 +1500,7 @@ router.get('/providers', async (req, res) => {
       FROM public.users u
       LEFT JOIN public.provider_profiles pp ON pp.provider_id = u.id
       LEFT JOIN (SELECT provider_id, COUNT(*) AS jobs_won FROM public.quotes WHERE status = 'accepted' GROUP BY provider_id) jw ON jw.provider_id = u.id
-      LEFT JOIN (SELECT provider_id, SUM(provider_payout) AS earnings_cents FROM public.transactions GROUP BY provider_id) er ON er.provider_id = u.id
+      LEFT JOIN (SELECT provider_id, SUM(provider_payout) AS earnings_cents FROM public.transactions WHERE status NOT IN ('awaiting_payment', 'payment_failed') GROUP BY provider_id) er ON er.provider_id = u.id
       LEFT JOIN (SELECT provider_id, AVG(rating) AS avg_rating, COUNT(*) AS review_count FROM public.reviews GROUP BY provider_id) rv ON rv.provider_id = u.id
       LEFT JOIN (SELECT q.provider_id, AVG(EXTRACT(EPOCH FROM (q.created_at - t.created_at)) / 3600.0) AS avg_response_hrs
                  FROM public.quotes q JOIN public.tenders t ON t.id = q.tender_id GROUP BY q.provider_id) rt ON rt.provider_id = u.id
@@ -1527,6 +1531,7 @@ router.get('/providers', async (req, res) => {
              COUNT(*)::int AS jobs
       FROM public.transactions tx
       JOIN public.users u ON u.id = tx.client_id
+      WHERE tx.status NOT IN ('awaiting_payment', 'payment_failed')
       GROUP BY u.id, u.display_code, name
       ORDER BY spend_cents DESC
       LIMIT 10
@@ -1619,6 +1624,7 @@ router.get('/analytics/supply-demand', async (req, res) => {
         SELECT t.category::text AS cat, COUNT(tx.id) AS jobs,
                SUM(tx.amount) AS gmv_cents, SUM(tx.platform_fee) AS rev_cents
         FROM public.transactions tx JOIN public.tenders t ON t.id = tx.tender_id
+        WHERE tx.status NOT IN ('awaiting_payment', 'payment_failed')
         GROUP BY t.category
       ) j ON j.cat = st.slug
       LEFT JOIN (
