@@ -523,6 +523,10 @@ router.get('/tenders', async (req, res) => {
         t.status, t.trashed_at,
         (t.expires_at IS NOT NULL AND t.expires_at <= NOW()) AS is_expired,
         EXISTS (SELECT 1 FROM public.quotes q WHERE q.tender_id = t.id AND q.status = 'accepted') AS has_accepted,
+        -- transactions.tender_id is ON DELETE RESTRICT (protects financial
+        -- records) — any tender with one CANNOT be hard-deleted. Surfaced so
+        -- the admin UI can disable that action instead of letting it fail.
+        EXISTS (SELECT 1 FROM public.transactions tx WHERE tx.tender_id = t.id) AS has_transaction,
         cu.first_name, cu.last_name, cu.email,
         cu.display_code AS client_code, cu.created_at AS client_since
       FROM public.tenders t
@@ -537,7 +541,13 @@ router.get('/tenders', async (req, res) => {
     if (uuids.length) {
       const qRes = await db.query(`
         SELECT q.id, q.tender_id, q.amount, q.status, q.created_at,
-               pu.display_code AS provider_code, pu.first_name, pu.last_name
+               pu.display_code AS provider_code, pu.first_name, pu.last_name,
+               -- transactions.quote_id is ON DELETE RESTRICT (same reasoning
+               -- as tenders.tender_id above) — a quote with one can never be
+               -- hard-deleted, even while itself still 'pending' (a
+               -- transaction row now exists from the moment WiPay checkout
+               -- is INITIATED, before the quote is marked accepted).
+               EXISTS (SELECT 1 FROM public.transactions tx WHERE tx.quote_id = q.id) AS has_transaction
         FROM public.quotes q
         JOIN public.users pu ON pu.id = q.provider_id
         WHERE q.tender_id = ANY($1::uuid[])
@@ -557,6 +567,7 @@ router.get('/tenders', async (req, res) => {
         amount: Math.round((q.amount || 0) / 100),
         date:   isoDate(q.created_at),
         status: QUOTE_STATUS_MAP[q.status] || 'pending',
+        hasTransaction: q.has_transaction,
       }));
       const accepted = rawQuotes.find((q) => q.status === 'accepted');
 
@@ -583,6 +594,7 @@ router.get('/tenders', async (req, res) => {
           : undefined,
         completed_date: r.status === 'completed' ? isoDate(r.updated_at) : undefined,
         trashed: r.trashed_at !== null,
+        hasTransaction: r.has_transaction,
       };
     });
 
@@ -748,6 +760,11 @@ router.patch('/tenders/:code/status', async (req, res) => {
 });
 
 // DELETE /api/admin/tenders/:code — permanent delete (cascades quotes + photos).
+// Blocked by Postgres (23503 foreign_key_violation) if a transaction row
+// references this tender — that FK is ON DELETE RESTRICT specifically to
+// protect financial records, so we never bypass it; we just explain it.
+// The frontend should already prevent this by disabling delete when
+// hasTransaction is true (see GET /tenders), so hitting this is the backstop.
 router.delete('/tenders/:code', async (req, res) => {
   try {
     const r = await db.query(
@@ -757,6 +774,13 @@ router.delete('/tenders/:code', async (req, res) => {
     if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Tender not found.' });
     res.json({ success: true });
   } catch (err) {
+    if (err.code === '23503') {
+      console.warn(`DELETE /api/admin/tenders/:code blocked by FK (has transaction history): ${req.params.code}`);
+      return res.status(409).json({
+        success: false,
+        message: 'This tender has payment/transaction history and cannot be permanently deleted, to protect financial records. Use Trash to remove it from view instead.',
+      });
+    }
     console.error('DELETE /api/admin/tenders/:code error:', err);
     res.status(500).json({ success: false, message: 'Failed to delete tender.' });
   }
@@ -764,6 +788,10 @@ router.delete('/tenders/:code', async (req, res) => {
 
 // DELETE /api/admin/tenders/:code/quotes/:pid — remove a single quote (by provider code).
 // One quote per (tender, provider) — uq_quotes_tender_provider — so this is unambiguous.
+// Blocked by Postgres (23503) if a transaction references this quote — same
+// ON DELETE RESTRICT protection as the tender delete above. The frontend
+// should already prevent this via the quote's hasTransaction flag; this is
+// the backstop with an honest message instead of a generic 500.
 router.delete('/tenders/:code/quotes/:pid', async (req, res) => {
   try {
     const del = await db.query(`
@@ -781,6 +809,13 @@ router.delete('/tenders/:code/quotes/:pid', async (req, res) => {
     );
     res.json({ success: true });
   } catch (err) {
+    if (err.code === '23503') {
+      console.warn(`DELETE /api/admin/tenders/:code/quotes/:pid blocked by FK (has transaction history): ${req.params.code}/${req.params.pid}`);
+      return res.status(409).json({
+        success: false,
+        message: 'This quote has payment history (a checkout was started on it) and cannot be removed, to protect financial records.',
+      });
+    }
     console.error('DELETE /api/admin/tenders/:code/quotes/:pid error:', err);
     res.status(500).json({ success: false, message: 'Failed to remove quote.' });
   }
