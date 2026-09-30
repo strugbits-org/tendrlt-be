@@ -705,6 +705,48 @@ router.post('/tenders/:code/restore', async (req, res) => {
   }
 });
 
+// ============================================================
+// PATCH /api/admin/tenders/:code/status   body: { status }
+// Manual admin override of a tender's lifecycle status. Restricted to the
+// real tender_status enum values (open | in_progress | completed) — the
+// frontend used to offer "Awarded"/"Expired"/"Cancelled" as well, but those
+// were carried over from the original static mockup and never corresponded
+// to anything in the schema; "expired" is a derived property of expires_at,
+// not a stored state, and there is no "cancelled" concept — an admin who
+// wants a tender gone uses Trash instead.
+// ============================================================
+const VALID_TENDER_STATUSES = ['open', 'in_progress', 'completed'];
+
+router.patch('/tenders/:code/status', async (req, res) => {
+  const { status } = req.body;
+  if (!VALID_TENDER_STATUSES.includes(status)) {
+    return res.status(400).json({ success: false, message: `Status must be one of: ${VALID_TENDER_STATUSES.join(', ')}.` });
+  }
+  try {
+    const r = await db.query(
+      `UPDATE public.tenders SET status = $2, updated_at = NOW()
+       WHERE display_code = $1
+       RETURNING id, client_id, display_code`,
+      [req.params.code, status]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Tender not found.' });
+
+    res.json({ success: true, status });
+
+    // Live-refresh anyone looking at this tender (provider Browse, homeowner
+    // dashboard) — no email, this is an admin data-correction tool, not a
+    // customer-facing lifecycle event like trash/restore.
+    const t = r.rows[0];
+    Promise.allSettled([
+      notifyUser(t.client_id, 'tenders-updated', { tenderId: t.id }),
+      notifyChannel('tenders-feed', 'tender-status-changed', { tenderId: t.id, status }),
+    ]).catch((err) => console.warn('status-change notify error:', err.message));
+  } catch (err) {
+    console.error('PATCH /api/admin/tenders/:code/status error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update tender status.' });
+  }
+});
+
 // DELETE /api/admin/tenders/:code — permanent delete (cascades quotes + photos).
 router.delete('/tenders/:code', async (req, res) => {
   try {
