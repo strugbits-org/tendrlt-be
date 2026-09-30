@@ -934,8 +934,18 @@ router.get('/public/stats', async (req, res) => {
         FROM public.tenders
         WHERE status = 'open' AND trashed_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())
       `),
+      // The `service_category` enum and `service_types.slug` disagree on two
+      // values ('auto' vs 'auto_servicing', 'child_care' vs 'child_patient_care')
+      // — map them here so the frontend's slug-keyed lookup doesn't silently
+      // show 0 for those two categories forever.
       db.query(`
-        SELECT category, COUNT(*)::int AS count
+        SELECT
+          CASE category
+            WHEN 'auto' THEN 'auto_servicing'
+            WHEN 'child_care' THEN 'child_patient_care'
+            ELSE category::text
+          END AS category,
+          COUNT(*)::int AS count
         FROM public.tenders
         WHERE status = 'open' AND trashed_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())
         GROUP BY category
