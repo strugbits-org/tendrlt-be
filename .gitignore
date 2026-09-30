@@ -63,5 +63,5 @@ config.local.json
 .envrc
 
 # editor / agent local config
-.vscode/
 .claude/settings.local.json
+config.bat
