@@ -4,8 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js",
+    "start": "node api.js && node index.js",
+    "dev": "node api.js && nodemon index.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:claude": "node scripts/test-claude-key.js",
     "count:tokens": "node scripts/count-tokens.js",

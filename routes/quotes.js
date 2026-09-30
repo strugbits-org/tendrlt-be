@@ -428,6 +428,72 @@ router.get('/mine', authenticate, authorize('provider'), async (req, res) => {
 });
 
 // ============================================================
+// GET /api/quotes/public/featured — PUBLIC (no auth). Up to 3 real, recent
+// pending quotes on still-open tenders, for the homepage "Quote Comparison"
+// showcase. Only admin-verified providers are eligible, so nothing
+// unverified/fake ever gets surfaced on the public marketing page. Declared
+// BEFORE the '/:id' route below so the literal '/public/featured' path is
+// not captured by the ':id' param.
+// ============================================================
+router.get('/public/featured', async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT
+        q.id, q.amount, q.timeline, q.message, q.created_at,
+        u.first_name, u.last_name,
+        pp.business_name, pp.years_experience, pp.documents, pp.is_verified,
+        st.display_name AS service_name, t.category,
+        COALESCE(r.avg_rating, 0)::float AS avg_rating,
+        COALESCE(r.review_count, 0) AS review_count,
+        COALESCE(jc.jobs_completed, 0) AS jobs_completed
+      FROM public.quotes q
+      JOIN public.tenders t ON t.id = q.tender_id
+      LEFT JOIN public.service_types st ON st.id = t.service_type_id
+      JOIN public.users u ON u.id = q.provider_id
+      JOIN public.provider_profiles pp ON pp.provider_id = q.provider_id AND pp.is_verified = TRUE
+      LEFT JOIN (
+        SELECT provider_id, AVG(rating) AS avg_rating, COUNT(*)::int AS review_count
+        FROM public.reviews GROUP BY provider_id
+      ) r ON r.provider_id = q.provider_id
+      LEFT JOIN (
+        SELECT provider_id, COUNT(*)::int AS jobs_completed
+        FROM public.transactions WHERE status = 'completed' GROUP BY provider_id
+      ) jc ON jc.provider_id = q.provider_id
+      WHERE q.status = 'pending'
+        AND t.status = 'open' AND t.trashed_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > NOW())
+      ORDER BY q.created_at DESC
+      LIMIT 3
+    `);
+
+    let bestIdx = 0;
+    result.rows.forEach((row, i) => {
+      if (row.avg_rating > result.rows[bestIdx].avg_rating) bestIdx = i;
+    });
+
+    const quotes = result.rows.map((row, i) => ({
+      id: row.id,
+      best: i === bestIdx,
+      providerName: row.business_name || `${row.first_name} ${(row.last_name || '?')[0]}.`,
+      role: row.service_name || row.category,
+      avgRating: row.avg_rating,
+      reviewCount: row.review_count,
+      yearsExperience: row.years_experience,
+      jobsCompleted: row.jobs_completed,
+      insuranceVerified: !!(row.documents && row.documents.insurance) && row.is_verified,
+      timeline: row.timeline,
+      message: row.message,
+      amount: row.amount,
+    }));
+
+    res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+    res.json({ success: true, quotes });
+  } catch (err) {
+    console.error('GET /api/quotes/public/featured error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load featured quotes.' });
+  }
+});
+
+// ============================================================
 // GET /api/quotes/:id
 // Returns full details of a single quote.
 // Must come AFTER all static paths (/received, /mine) so the
