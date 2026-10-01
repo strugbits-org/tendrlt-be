@@ -1229,10 +1229,10 @@ router.patch('/fee-config/minimums', async (req, res) => {
 
 // ============================================================
 // GET /api/admin/revenue?period=30d
-// Real platform revenue from public.transactions (recorded on quote accept —
-// WiPay deferred, status 'held'; no money moves yet). Returns money fields the
-// admin dashboard revenue widgets merge over their mock period row; activity /
-// growth metrics remain mock until separately wired.
+// Real platform-overview data for the admin Dashboard, from
+// public.transactions/tenders/quotes/users/provider_profiles. Returns the
+// full set of fields the dashboard's revenue, activity, growth, category,
+// funnel, and urgency widgets need — no mock data left once this responds.
 // See documentation/PAYMENTS_AND_JOB_WORKFLOW.md.
 // ============================================================
 const REVENUE_WINDOWS = { '7d': 7, '30d': 30, '90d': 90, '1y': 365, all: null };
@@ -1245,9 +1245,28 @@ const compactMoney = (cents) => {
 };
 const fullMoney = (cents) => Math.round((cents || 0) / 100).toLocaleString('en-US');
 
+// Formats a duration in seconds as "Xh" (<48h) or "X.Yd" otherwise — matches
+// the dashboard's existing "16h"/"18h" style for realistic accept times.
+const fmtDuration = (seconds) => {
+  if (seconds == null || !Number.isFinite(Number(seconds))) return '—';
+  const hours = Number(seconds) / 3600;
+  if (hours < 48) return Math.max(0, Math.round(hours)) + 'h';
+  return (hours / 24).toFixed(1) + 'd';
+};
+
+const CATEGORY_COLORS = ['var(--sage-mid)', 'var(--blue)', 'var(--amber)', 'var(--purple)', '#34d399', '#f87171'];
+const CATEGORY_OTHER_COLOR = '#475569';
+
+const FUNNEL_COLORS = { posted: '#4ade80', quoted: '#22c55e', accepted: '#fbbf24', paid: '#60a5fa', completed: '#a78bfa' };
+
+const URGENCY_LABELS = { emergency: 'Emergency', urgent: 'Urgent', soon: 'Soon', flexible: 'Flexible', planning: 'Planning ahead' };
+const URGENCY_COLORS = { emergency: '#f87171', urgent: '#fb923c', soon: '#fbbf24', flexible: '#60a5fa', planning: '#a78bfa' };
+const URGENCY_ORDER = ['emergency', 'urgent', 'soon', 'flexible', 'planning'];
+
 router.get('/revenue', async (req, res) => {
   const period = REVENUE_WINDOWS.hasOwnProperty(req.query.period) ? req.query.period : '30d';
   const days = REVENUE_WINDOWS[period]; // null = all-time
+  const windowCond = `($1::int IS NULL OR created_at >= NOW() - (INTERVAL '1 day' * $1))`;
   try {
     const sums = `
       SELECT COALESCE(SUM(amount),0)::bigint       AS gmv,
@@ -1260,20 +1279,110 @@ router.get('/revenue', async (req, res) => {
       -- paid — exclude unpaid/abandoned attempts from platform revenue.
       WHERE status NOT IN ('awaiting_payment', 'payment_failed')`;
 
-    const current = await db.query(
-      `${sums} AND ($1::int IS NULL OR created_at >= NOW() - (INTERVAL '1 day' * $1))`,
-      [days]
-    );
+    const prevWindowJobsSql = `SELECT COUNT(*)::int AS n FROM public.tenders
+      WHERE trashed_at IS NULL AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1)`;
+    const prevWindowQuotesSql = `SELECT COUNT(*)::int AS n FROM public.quotes q JOIN public.tenders t ON t.id = q.tender_id
+      WHERE t.trashed_at IS NULL AND q.created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND q.created_at < NOW() - (INTERVAL '1 day' * $1)`;
+
+    const [
+      current, prev,
+      jobsPostedRes, quotesSubmittedRes,
+      prevJobsPostedRes, prevQuotesSubmittedRes,
+      acceptTimeRes, prevAcceptTimeRes,
+      newUsersRes, prevNewUsersRes, totalsRes,
+      categoriesRes,
+      quotedCountRes, acceptedCountRes, paidCountRes, completedCountRes,
+      urgencyRes, emergencyFirstQuoteRes,
+    ] = await Promise.all([
+      db.query(`${sums} AND ${windowCond}`, [days]),
+      days !== null
+        ? db.query(
+            `${sums} AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1)`,
+            [days]
+          )
+        : Promise.resolve({ rows: [{ rev: 0, done: 0 }] }),
+      db.query(`SELECT COUNT(*)::int AS n FROM public.tenders WHERE trashed_at IS NULL AND ${windowCond}`, [days]),
+      db.query(
+        `SELECT COUNT(*)::int AS n FROM public.quotes q
+         JOIN public.tenders t ON t.id = q.tender_id
+         WHERE t.trashed_at IS NULL AND ($1::int IS NULL OR q.created_at >= NOW() - (INTERVAL '1 day' * $1))`,
+        [days]
+      ),
+      days !== null ? db.query(prevWindowJobsSql, [days]) : Promise.resolve({ rows: [{ n: 0 }] }),
+      days !== null ? db.query(prevWindowQuotesSql, [days]) : Promise.resolve({ rows: [{ n: 0 }] }),
+      db.query(
+        `SELECT AVG(EXTRACT(EPOCH FROM (q.updated_at - t.created_at)))::float AS avg_seconds
+         FROM public.quotes q JOIN public.tenders t ON t.id = q.tender_id
+         WHERE q.status = 'accepted' AND ($1::int IS NULL OR q.updated_at >= NOW() - (INTERVAL '1 day' * $1))`,
+        [days]
+      ),
+      days !== null
+        ? db.query(
+            `SELECT AVG(EXTRACT(EPOCH FROM (q.updated_at - t.created_at)))::float AS avg_seconds
+             FROM public.quotes q JOIN public.tenders t ON t.id = q.tender_id
+             WHERE q.status = 'accepted'
+               AND q.updated_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND q.updated_at < NOW() - (INTERVAL '1 day' * $1)`,
+            [days]
+          )
+        : Promise.resolve({ rows: [{ avg_seconds: null }] }),
+      db.query(
+        `SELECT role, COUNT(*)::int AS n FROM public.users
+         WHERE role IN ('homeowner','provider') AND ${windowCond} GROUP BY role`,
+        [days]
+      ),
+      days !== null
+        ? db.query(
+            `SELECT role, COUNT(*)::int AS n FROM public.users
+             WHERE role IN ('homeowner','provider')
+               AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1)
+             GROUP BY role`,
+            [days]
+          )
+        : Promise.resolve({ rows: [] }),
+      db.query(`
+        SELECT
+          (SELECT COUNT(*) FROM public.users WHERE role = 'homeowner')::int AS total_clients,
+          (SELECT COUNT(*) FROM public.users WHERE role = 'provider')::int AS total_providers,
+          (SELECT COUNT(*) FROM public.provider_profiles WHERE verification_status = 'approved')::int AS verified_providers,
+          (SELECT COUNT(*) FROM public.provider_profiles WHERE is_onboarding_complete = TRUE AND verification_status = 'pending')::int AS pending_verification
+      `),
+      db.query(
+        `SELECT COALESCE(st.display_name, t.category::text) AS name, COUNT(*)::int AS n
+         FROM public.tenders t LEFT JOIN public.service_types st ON st.id = t.service_type_id
+         WHERE t.trashed_at IS NULL AND ${windowCond.replace(/created_at/g, 't.created_at')}
+         GROUP BY 1 ORDER BY n DESC`,
+        [days]
+      ),
+      db.query(`SELECT COUNT(*)::int AS n FROM public.tenders WHERE trashed_at IS NULL AND quotes_count > 0 AND ${windowCond}`, [days]),
+      db.query(
+        `SELECT COUNT(DISTINCT t.id)::int AS n FROM public.tenders t
+         JOIN public.quotes q ON q.tender_id = t.id AND q.status = 'accepted'
+         WHERE t.trashed_at IS NULL AND ${windowCond.replace(/created_at/g, 't.created_at')}`,
+        [days]
+      ),
+      db.query(
+        `SELECT COUNT(DISTINCT tx.tender_id)::int AS n FROM public.transactions tx
+         JOIN public.tenders t ON t.id = tx.tender_id
+         WHERE tx.status NOT IN ('awaiting_payment','payment_failed') AND t.trashed_at IS NULL
+           AND ${windowCond.replace(/created_at/g, 't.created_at')}`,
+        [days]
+      ),
+      db.query(`SELECT COUNT(*)::int AS n FROM public.tenders WHERE status = 'completed' AND trashed_at IS NULL AND ${windowCond}`, [days]),
+      db.query(`SELECT urgency, COUNT(*)::int AS n FROM public.tenders WHERE trashed_at IS NULL AND ${windowCond} GROUP BY urgency`, [days]),
+      db.query(
+        `SELECT AVG(EXTRACT(EPOCH FROM (fq.first_at - t.created_at)))::float AS avg_seconds
+         FROM public.tenders t
+         JOIN LATERAL (SELECT MIN(created_at) AS first_at FROM public.quotes WHERE tender_id = t.id) fq ON fq.first_at IS NOT NULL
+         WHERE t.urgency = 'emergency' AND t.trashed_at IS NULL AND ${windowCond.replace(/created_at/g, 't.created_at')}`,
+        [days]
+      ),
+    ]);
+
     const c = current.rows[0];
 
     // Delta vs the immediately preceding window of equal length (skip for all-time).
     let deltaRev = '—';
     if (days !== null) {
-      const prev = await db.query(
-        `${sums} AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2)
-                   AND created_at <  NOW() - (INTERVAL '1 day' * $1)`,
-        [days]
-      );
       const prevRev = Number(prev.rows[0].rev);
       const curRev = Number(c.rev);
       if (prevRev > 0) {
@@ -1285,6 +1394,95 @@ router.get('/revenue', async (req, res) => {
     }
 
     const done = c.done || 0;
+    const jobs = jobsPostedRes.rows[0].n || 0;
+    const quotes = quotesSubmittedRes.rows[0].n || 0;
+
+    // Period-over-period % change — same "vs previous window of equal
+    // length" logic as deltaRev above, for the three Activity KPI cards.
+    const pctDelta = (curVal, prevVal) => {
+      if (days === null) return '—';
+      if (prevVal > 0) {
+        const pct = ((curVal - prevVal) / prevVal) * 100;
+        return `${pct >= 0 ? '↑' : '↓'} ${Math.abs(pct).toFixed(1)}%`;
+      }
+      return curVal > 0 ? '↑ new' : '—';
+    };
+    const deltaJobs = pctDelta(jobs, prevJobsPostedRes.rows[0].n || 0);
+    const deltaQuotes = pctDelta(quotes, prevQuotesSubmittedRes.rows[0].n || 0);
+    const deltaDone = pctDelta(done, prev.rows[0].done || 0);
+
+    const acceptSeconds = acceptTimeRes.rows[0].avg_seconds;
+    let deltaTime = '—';
+    const prevAcceptSeconds = prevAcceptTimeRes.rows[0]?.avg_seconds;
+    if (acceptSeconds != null && prevAcceptSeconds != null) {
+      const diffHours = (prevAcceptSeconds - acceptSeconds) / 3600;
+      if (Math.abs(diffHours) >= 0.05) {
+        deltaTime = diffHours >= 0
+          ? `↓ ${diffHours.toFixed(1)}h faster`
+          : `↑ ${Math.abs(diffHours).toFixed(1)}h slower`;
+      }
+    }
+
+    const newClients = newUsersRes.rows.find((r) => r.role === 'homeowner')?.n || 0;
+    const newProvs = newUsersRes.rows.find((r) => r.role === 'provider')?.n || 0;
+    const prevNewClients = prevNewUsersRes.rows.find((r) => r.role === 'homeowner')?.n || 0;
+    const prevNewProvs = prevNewUsersRes.rows.find((r) => r.role === 'provider')?.n || 0;
+    const deltaNewClients = pctDelta(newClients, prevNewClients);
+    const deltaNewProvs = pctDelta(newProvs, prevNewProvs);
+
+    const t = totalsRes.rows[0];
+    const verifiedPct = t.total_providers ? Math.round((t.verified_providers / t.total_providers) * 100) : 0;
+
+    // Top 5 categories by job count; the rest collapse into "Other" (mirrors
+    // the dashboard's original fixed-7-row layout).
+    const catRows = categoriesRes.rows;
+    const topCats = catRows.slice(0, 5);
+    const otherCount = catRows.slice(5).reduce((sum, r) => sum + r.n, 0);
+    const categories = topCats.map((r, i) => ({
+      name: r.name, val: r.n,
+      pct: jobs ? Math.round((r.n / jobs) * 100) : 0,
+      color: CATEGORY_COLORS[i % CATEGORY_COLORS.length],
+    }));
+    if (otherCount > 0) {
+      categories.push({ name: 'Other', val: otherCount, pct: jobs ? Math.round((otherCount / jobs) * 100) : 0, color: CATEGORY_OTHER_COLOR });
+    }
+
+    const quotedCount = quotedCountRes.rows[0].n || 0;
+    const acceptedCount = acceptedCountRes.rows[0].n || 0;
+    const paidCount = paidCountRes.rows[0].n || 0;
+    const completedCount = completedCountRes.rows[0].n || 0;
+    const pctOf = (n) => (jobs ? Math.round((n / jobs) * 100) : 0);
+    const funnel = [
+      { label: 'Jobs posted', n: jobs, pct: 100, color: FUNNEL_COLORS.posted },
+      { label: 'Quotes received', n: quotedCount, pct: pctOf(quotedCount), color: FUNNEL_COLORS.quoted },
+      { label: 'Quotes accepted', n: acceptedCount, pct: pctOf(acceptedCount), color: FUNNEL_COLORS.accepted },
+      { label: 'Payment received', n: paidCount, pct: pctOf(paidCount), color: FUNNEL_COLORS.paid },
+      { label: 'Job completed', n: completedCount, pct: pctOf(completedCount), color: FUNNEL_COLORS.completed },
+    ];
+
+    const urgencyCounts = Object.fromEntries(urgencyRes.rows.map((r) => [r.urgency, r.n]));
+    const urgencyTotal = urgencyRes.rows.reduce((sum, r) => sum + r.n, 0);
+    const urgency = URGENCY_ORDER
+      .filter((key) => urgencyCounts[key])
+      .map((key) => ({
+        label: URGENCY_LABELS[key], count: urgencyCounts[key],
+        pct: urgencyTotal ? Math.round((urgencyCounts[key] / urgencyTotal) * 100) : 0,
+        color: URGENCY_COLORS[key],
+      }));
+    const timeSensitivePct = urgencyTotal
+      ? Math.round(((urgencyCounts.emergency || 0) + (urgencyCounts.urgent || 0)) / urgencyTotal * 100)
+      : 0;
+    const emergencyFirstQuoteSeconds = emergencyFirstQuoteRes.rows[0]?.avg_seconds;
+    const urgencyNote = urgencyTotal
+      ? `${timeSensitivePct}% time-sensitive` + (emergencyFirstQuoteSeconds != null
+          ? ` · avg ${fmtDuration(emergencyFirstQuoteSeconds)} to first Emergency quote`
+          : '')
+      : 'No tenders in this period yet.';
+
+    const cfeeNum = Number(c.cfee), pfeeNum = Number(c.pfee);
+    const feeTotal = cfeeNum + pfeeNum;
+    const clientPct = feeTotal ? Math.round((cfeeNum / feeTotal) * 100) : 50;
+
     res.json({
       success: true,
       revenue: {
@@ -1298,6 +1496,29 @@ router.get('/revenue', async (req, res) => {
         fee_provs: fullMoney(c.pfee),
         fee_per_job: done ? 'J$' + fullMoney(Number(c.rev) / done) : 'J$0',
         avg_gmv: done ? 'J$' + fullMoney(Number(c.gmv) / done) : 'J$0',
+        jobs,
+        quotes,
+        accept_time: fmtDuration(acceptSeconds),
+        delta_time: deltaTime,
+        delta_jobs: deltaJobs,
+        delta_quotes: deltaQuotes,
+        delta_done: deltaDone,
+        new_clients: newClients,
+        new_provs: newProvs,
+        delta_new_clients: deltaNewClients,
+        delta_new_provs: deltaNewProvs,
+        avgQuotesPerJob: jobs ? (quotes / jobs).toFixed(1) : '0.0',
+        totalClients: t.total_clients,
+        totalProviders: t.total_providers,
+        verifiedProviders: t.verified_providers,
+        verifiedProvidersPct: verifiedPct,
+        pendingVerification: t.pending_verification,
+        categories,
+        funnel,
+        urgency,
+        urgencyNote,
+        clientPct,
+        providerPct: 100 - clientPct,
       },
     });
   } catch (err) {
