@@ -39,6 +39,10 @@ router.get('/me', authenticate, authorize('provider'), async (req, res) => {
     // Before: 3 × 5 = 15 DB round trips.  After: 3 round trips total.
     // Wrap array_agg results in json_agg so pg parses them as JS arrays,
     // not raw PostgreSQL array strings (which happens inside scalar subqueries).
+    // Also includes the public-profile stats (rating, jobs won, response
+    // time) that /provider-profile needs — additive fields only, so the
+    // onboarding page (which only reads profile/services/parishes/user)
+    // is unaffected.
     const result = await db.queryAsUser(req.user.id, `
       SELECT
         (SELECT to_json(p.*) FROM public.provider_profiles p WHERE p.provider_id = $1) AS profile,
@@ -49,13 +53,41 @@ router.get('/me', authenticate, authorize('provider'), async (req, res) => {
         (
           SELECT COALESCE(json_agg(pa.parish ORDER BY pa.created_at), '[]'::json)
           FROM public.provider_parishes pa WHERE pa.provider_id = $1
-        ) AS parishes
+        ) AS parishes,
+        u.created_at AS member_since,
+        (SELECT AVG(rating) FROM public.reviews WHERE provider_id = $1) AS avg_rating,
+        (SELECT COUNT(*) FROM public.reviews WHERE provider_id = $1)::int AS review_count,
+        (SELECT COUNT(*) FROM public.quotes WHERE provider_id = $1 AND status = 'accepted')::int AS jobs_won,
+        (SELECT AVG(EXTRACT(EPOCH FROM (q.created_at - t.created_at)) / 3600.0)
+           FROM public.quotes q JOIN public.tenders t ON t.id = q.tender_id WHERE q.provider_id = $1) AS avg_response_hrs,
+        (SELECT COALESCE(json_agg(rv), '[]'::json) FROM (
+          SELECT r.rating, r.comment, r.created_at,
+                 (cu.first_name || ' ' || LEFT(cu.last_name, 1) || '.') AS client_name,
+                 COALESCE(st.display_name, t.category::text) AS job_label
+          FROM public.reviews r
+          JOIN public.users cu ON cu.id = r.client_id
+          JOIN public.tenders t ON t.id = r.tender_id
+          LEFT JOIN public.service_types st ON st.id = t.service_type_id
+          WHERE r.provider_id = $1
+          ORDER BY r.created_at DESC
+          LIMIT 20
+        ) rv) AS reviews_json,
+        (SELECT COALESCE(json_agg(rd), '[]'::json) FROM (
+          SELECT rating AS star, COUNT(*)::int AS count
+          FROM public.reviews WHERE provider_id = $1 GROUP BY rating
+        ) rd) AS rating_dist_json
+      FROM public.users u WHERE u.id = $1
     `, [req.user.id]);
 
     const row = result.rows[0];
+    const profile = row.profile || null;
+    const portfolioUrls = (profile?.portfolio_paths || []).map(
+      (p) => supabase.storage.from('provider-portfolio').getPublicUrl(p).data.publicUrl
+    );
+
     res.json({
       success: true,
-      profile:  row.profile  || null,
+      profile,
       services: row.services || [],
       parishes: row.parishes || [],
       user: {
@@ -64,6 +96,16 @@ router.get('/me', authenticate, authorize('provider'), async (req, res) => {
         phone_number:     req.user.phone_number,
         parish:           req.user.parish,
         provider_service: req.user.provider_service,
+      },
+      stats: {
+        memberSince:    row.member_since,
+        avgRating:      row.avg_rating != null ? parseFloat(row.avg_rating) : null,
+        reviewCount:    row.review_count || 0,
+        jobsCompleted:  row.jobs_won || 0,
+        avgResponseHrs: row.avg_response_hrs != null ? parseFloat(row.avg_response_hrs) : null,
+        portfolioUrls,
+        reviews: row.reviews_json || [],
+        ratingDistribution: row.rating_dist_json || [],
       },
     });
   } catch (err) {

@@ -949,18 +949,20 @@ const shapeFeedbackItem = (r) => ({
   name: r.name,
   email: r.email,
   role: toFeedbackRole(r.role),
+  parish: r.parish || null,
   msg: r.message,
   rating: r.rating,
   followUp: r.follow_up,
   date: r.created_at.toISOString().slice(0, 10),
   status: r.status,
+  approvedForDisplay: r.approved_for_display === true,
 });
 
 // GET /api/admin/feedback-submissions
 router.get('/feedback-submissions', async (req, res) => {
   try {
     const r = await db.query(`
-      SELECT id, cat, name, email, role, rating, follow_up, message, status, created_at
+      SELECT id, cat, name, email, role, parish, rating, follow_up, message, status, created_at, approved_for_display
       FROM public.feedback_submissions
       ORDER BY created_at DESC
     `);
@@ -987,6 +989,28 @@ router.patch('/feedback-submissions/:id/status', async (req, res) => {
   } catch (err) {
     console.error('PATCH /api/admin/feedback-submissions/:id/status error:', err);
     res.status(500).json({ success: false, message: 'Failed to update status.' });
+  }
+});
+
+// PATCH /api/admin/feedback-submissions/:id/approve-display   body: { approved: boolean }
+// Gates whether a 'feedback'-category submission can appear as a public
+// homepage testimonial (GET /api/feedback/public/testimonials) — off by
+// default so nothing goes live without an admin reviewing it first.
+router.patch('/feedback-submissions/:id/approve-display', async (req, res) => {
+  const { approved } = req.body || {};
+  if (typeof approved !== 'boolean') {
+    return res.status(400).json({ success: false, message: 'approved must be a boolean.' });
+  }
+  try {
+    const r = await db.query(
+      `UPDATE public.feedback_submissions SET approved_for_display = $2 WHERE id = $1 RETURNING id`,
+      [req.params.id, approved]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Submission not found.' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('PATCH /api/admin/feedback-submissions/:id/approve-display error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update display approval.' });
   }
 });
 
@@ -1279,66 +1303,63 @@ router.get('/revenue', async (req, res) => {
       -- paid — exclude unpaid/abandoned attempts from platform revenue.
       WHERE status NOT IN ('awaiting_payment', 'payment_failed')`;
 
-    const prevWindowJobsSql = `SELECT COUNT(*)::int AS n FROM public.tenders
-      WHERE trashed_at IS NULL AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1)`;
-    const prevWindowQuotesSql = `SELECT COUNT(*)::int AS n FROM public.quotes q JOIN public.tenders t ON t.id = q.tender_id
-      WHERE t.trashed_at IS NULL AND q.created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND q.created_at < NOW() - (INTERVAL '1 day' * $1)`;
-
-    const [
-      current, prev,
-      jobsPostedRes, quotesSubmittedRes,
-      prevJobsPostedRes, prevQuotesSubmittedRes,
-      acceptTimeRes, prevAcceptTimeRes,
-      newUsersRes, prevNewUsersRes, totalsRes,
-      categoriesRes,
-      quotedCountRes, acceptedCountRes, paidCountRes, completedCountRes,
-      urgencyRes, emergencyFirstQuoteRes,
-    ] = await Promise.all([
-      db.query(`${sums} AND ${windowCond}`, [days]),
-      days !== null
-        ? db.query(
-            `${sums} AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1)`,
-            [days]
-          )
-        : Promise.resolve({ rows: [{ rev: 0, done: 0 }] }),
-      db.query(`SELECT COUNT(*)::int AS n FROM public.tenders WHERE trashed_at IS NULL AND ${windowCond}`, [days]),
-      db.query(
-        `SELECT COUNT(*)::int AS n FROM public.quotes q
-         JOIN public.tenders t ON t.id = q.tender_id
-         WHERE t.trashed_at IS NULL AND ($1::int IS NULL OR q.created_at >= NOW() - (INTERVAL '1 day' * $1))`,
-        [days]
-      ),
-      days !== null ? db.query(prevWindowJobsSql, [days]) : Promise.resolve({ rows: [{ n: 0 }] }),
-      days !== null ? db.query(prevWindowQuotesSql, [days]) : Promise.resolve({ rows: [{ n: 0 }] }),
-      db.query(
-        `SELECT AVG(EXTRACT(EPOCH FROM (q.updated_at - t.created_at)))::float AS avg_seconds
-         FROM public.quotes q JOIN public.tenders t ON t.id = q.tender_id
-         WHERE q.status = 'accepted' AND ($1::int IS NULL OR q.updated_at >= NOW() - (INTERVAL '1 day' * $1))`,
-        [days]
-      ),
-      days !== null
-        ? db.query(
-            `SELECT AVG(EXTRACT(EPOCH FROM (q.updated_at - t.created_at)))::float AS avg_seconds
-             FROM public.quotes q JOIN public.tenders t ON t.id = q.tender_id
-             WHERE q.status = 'accepted'
-               AND q.updated_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND q.updated_at < NOW() - (INTERVAL '1 day' * $1)`,
-            [days]
-          )
-        : Promise.resolve({ rows: [{ avg_seconds: null }] }),
-      db.query(
-        `SELECT role, COUNT(*)::int AS n FROM public.users
-         WHERE role IN ('homeowner','provider') AND ${windowCond} GROUP BY role`,
-        [days]
-      ),
-      days !== null
-        ? db.query(
-            `SELECT role, COUNT(*)::int AS n FROM public.users
-             WHERE role IN ('homeowner','provider')
-               AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1)
-             GROUP BY role`,
-            [days]
-          )
-        : Promise.resolve({ rows: [] }),
+    // Consolidated into 6 queries (down from 18) using FILTER(WHERE ...) for
+    // current/previous-window pairs and json_agg subqueries for the two
+    // GROUP BY breakdowns — each one firing 16-18 queries in parallel was
+    // exhausting the connection pool (max: 10) and causing intermittent
+    // ETIMEDOUTs under load, which made the whole endpoint fail and silently
+    // fall back to stale mock data on the frontend.
+    const [revRes, tenderRes, quoteRes, userRes, totalsRes, aggRes] = await Promise.all([
+      db.query(`
+        SELECT
+          COALESCE(SUM(amount)       FILTER (WHERE ${windowCond}), 0)::bigint AS gmv,
+          COALESCE(SUM(client_fee)   FILTER (WHERE ${windowCond}), 0)::bigint AS cfee,
+          COALESCE(SUM(provider_fee) FILTER (WHERE ${windowCond}), 0)::bigint AS pfee,
+          COALESCE(SUM(platform_fee) FILTER (WHERE ${windowCond}), 0)::bigint AS rev,
+          COUNT(*)                    FILTER (WHERE ${windowCond})::int AS done,
+          COALESCE(SUM(platform_fee) FILTER (WHERE $1::int IS NOT NULL AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1)), 0)::bigint AS prev_rev,
+          COUNT(*)                    FILTER (WHERE $1::int IS NOT NULL AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1))::int AS prev_done
+        FROM public.transactions
+        WHERE status NOT IN ('awaiting_payment', 'payment_failed')
+      `, [days]),
+      db.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE ${windowCond})::int AS jobs,
+          COUNT(*) FILTER (WHERE $1::int IS NOT NULL AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1))::int AS prev_jobs,
+          COUNT(*) FILTER (WHERE quotes_count > 0 AND (${windowCond}))::int AS quoted_count,
+          COUNT(*) FILTER (WHERE status = 'completed' AND (${windowCond}))::int AS completed_count,
+          COUNT(*) FILTER (
+            WHERE (${windowCond})
+              AND EXISTS (SELECT 1 FROM public.quotes q WHERE q.tender_id = tenders.id AND q.status = 'accepted')
+          )::int AS accepted_count,
+          COUNT(*) FILTER (
+            WHERE (${windowCond})
+              AND EXISTS (SELECT 1 FROM public.transactions tx WHERE tx.tender_id = tenders.id AND tx.status NOT IN ('awaiting_payment','payment_failed'))
+          )::int AS paid_count
+        FROM public.tenders
+        WHERE trashed_at IS NULL
+      `, [days]),
+      db.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE $1::int IS NULL OR q.created_at >= NOW() - (INTERVAL '1 day' * $1))::int AS quotes_cur,
+          COUNT(*) FILTER (WHERE $1::int IS NOT NULL AND q.created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND q.created_at < NOW() - (INTERVAL '1 day' * $1))::int AS quotes_prev,
+          AVG(EXTRACT(EPOCH FROM (q.updated_at - t.created_at))) FILTER (
+            WHERE q.status = 'accepted' AND ($1::int IS NULL OR q.updated_at >= NOW() - (INTERVAL '1 day' * $1))
+          )::float AS accept_seconds_cur,
+          AVG(EXTRACT(EPOCH FROM (q.updated_at - t.created_at))) FILTER (
+            WHERE q.status = 'accepted' AND $1::int IS NOT NULL AND q.updated_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND q.updated_at < NOW() - (INTERVAL '1 day' * $1)
+          )::float AS accept_seconds_prev
+        FROM public.quotes q JOIN public.tenders t ON t.id = q.tender_id
+        WHERE t.trashed_at IS NULL
+      `, [days]),
+      db.query(`
+        SELECT role,
+          COUNT(*) FILTER (WHERE ${windowCond})::int AS n_cur,
+          COUNT(*) FILTER (WHERE $1::int IS NOT NULL AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1))::int AS n_prev
+        FROM public.users
+        WHERE role IN ('homeowner','provider')
+        GROUP BY role
+      `, [days]),
       db.query(`
         SELECT
           (SELECT COUNT(*) FROM public.users WHERE role = 'homeowner')::int AS total_clients,
@@ -1346,44 +1367,38 @@ router.get('/revenue', async (req, res) => {
           (SELECT COUNT(*) FROM public.provider_profiles WHERE verification_status = 'approved')::int AS verified_providers,
           (SELECT COUNT(*) FROM public.provider_profiles WHERE is_onboarding_complete = TRUE AND verification_status = 'pending')::int AS pending_verification
       `),
-      db.query(
-        `SELECT COALESCE(st.display_name, t.category::text) AS name, COUNT(*)::int AS n
-         FROM public.tenders t LEFT JOIN public.service_types st ON st.id = t.service_type_id
-         WHERE t.trashed_at IS NULL AND ${windowCond.replace(/created_at/g, 't.created_at')}
-         GROUP BY 1 ORDER BY n DESC`,
-        [days]
-      ),
-      db.query(`SELECT COUNT(*)::int AS n FROM public.tenders WHERE trashed_at IS NULL AND quotes_count > 0 AND ${windowCond}`, [days]),
-      db.query(
-        `SELECT COUNT(DISTINCT t.id)::int AS n FROM public.tenders t
-         JOIN public.quotes q ON q.tender_id = t.id AND q.status = 'accepted'
-         WHERE t.trashed_at IS NULL AND ${windowCond.replace(/created_at/g, 't.created_at')}`,
-        [days]
-      ),
-      db.query(
-        `SELECT COUNT(DISTINCT tx.tender_id)::int AS n FROM public.transactions tx
-         JOIN public.tenders t ON t.id = tx.tender_id
-         WHERE tx.status NOT IN ('awaiting_payment','payment_failed') AND t.trashed_at IS NULL
-           AND ${windowCond.replace(/created_at/g, 't.created_at')}`,
-        [days]
-      ),
-      db.query(`SELECT COUNT(*)::int AS n FROM public.tenders WHERE status = 'completed' AND trashed_at IS NULL AND ${windowCond}`, [days]),
-      db.query(`SELECT urgency, COUNT(*)::int AS n FROM public.tenders WHERE trashed_at IS NULL AND ${windowCond} GROUP BY urgency`, [days]),
-      db.query(
-        `SELECT AVG(EXTRACT(EPOCH FROM (fq.first_at - t.created_at)))::float AS avg_seconds
-         FROM public.tenders t
-         JOIN LATERAL (SELECT MIN(created_at) AS first_at FROM public.quotes WHERE tender_id = t.id) fq ON fq.first_at IS NOT NULL
-         WHERE t.urgency = 'emergency' AND t.trashed_at IS NULL AND ${windowCond.replace(/created_at/g, 't.created_at')}`,
-        [days]
-      ),
+      db.query(`
+        SELECT
+          (SELECT json_agg(x) FROM (
+            SELECT urgency, COUNT(*)::int AS n
+            FROM public.tenders
+            WHERE trashed_at IS NULL AND (${windowCond})
+            GROUP BY urgency
+          ) x) AS urgency_json,
+          (SELECT json_agg(x) FROM (
+            SELECT COALESCE(st.display_name, t.category::text) AS name, COUNT(*)::int AS n
+            FROM public.tenders t LEFT JOIN public.service_types st ON st.id = t.service_type_id
+            WHERE t.trashed_at IS NULL AND ($1::int IS NULL OR t.created_at >= NOW() - (INTERVAL '1 day' * $1))
+            GROUP BY 1 ORDER BY n DESC
+          ) x) AS categories_json,
+          (
+            SELECT AVG(EXTRACT(EPOCH FROM (fq.first_at - t2.created_at)))::float
+            FROM public.tenders t2
+            JOIN LATERAL (SELECT MIN(created_at) AS first_at FROM public.quotes WHERE tender_id = t2.id) fq ON fq.first_at IS NOT NULL
+            WHERE t2.urgency = 'emergency' AND t2.trashed_at IS NULL AND ($1::int IS NULL OR t2.created_at >= NOW() - (INTERVAL '1 day' * $1))
+          ) AS emergency_first_seconds
+      `, [days]),
     ]);
 
-    const c = current.rows[0];
+    const c = revRes.rows[0];
+    const tr = tenderRes.rows[0];
+    const qr = quoteRes.rows[0];
+    const agg = aggRes.rows[0];
 
     // Delta vs the immediately preceding window of equal length (skip for all-time).
     let deltaRev = '—';
     if (days !== null) {
-      const prevRev = Number(prev.rows[0].rev);
+      const prevRev = Number(c.prev_rev);
       const curRev = Number(c.rev);
       if (prevRev > 0) {
         const pct = ((curRev - prevRev) / prevRev) * 100;
@@ -1394,8 +1409,8 @@ router.get('/revenue', async (req, res) => {
     }
 
     const done = c.done || 0;
-    const jobs = jobsPostedRes.rows[0].n || 0;
-    const quotes = quotesSubmittedRes.rows[0].n || 0;
+    const jobs = tr.jobs || 0;
+    const quotes = qr.quotes_cur || 0;
 
     // Period-over-period % change — same "vs previous window of equal
     // length" logic as deltaRev above, for the three Activity KPI cards.
@@ -1407,13 +1422,13 @@ router.get('/revenue', async (req, res) => {
       }
       return curVal > 0 ? '↑ new' : '—';
     };
-    const deltaJobs = pctDelta(jobs, prevJobsPostedRes.rows[0].n || 0);
-    const deltaQuotes = pctDelta(quotes, prevQuotesSubmittedRes.rows[0].n || 0);
-    const deltaDone = pctDelta(done, prev.rows[0].done || 0);
+    const deltaJobs = pctDelta(jobs, tr.prev_jobs || 0);
+    const deltaQuotes = pctDelta(quotes, qr.quotes_prev || 0);
+    const deltaDone = pctDelta(done, c.prev_done || 0);
 
-    const acceptSeconds = acceptTimeRes.rows[0].avg_seconds;
+    const acceptSeconds = qr.accept_seconds_cur;
     let deltaTime = '—';
-    const prevAcceptSeconds = prevAcceptTimeRes.rows[0]?.avg_seconds;
+    const prevAcceptSeconds = qr.accept_seconds_prev;
     if (acceptSeconds != null && prevAcceptSeconds != null) {
       const diffHours = (prevAcceptSeconds - acceptSeconds) / 3600;
       if (Math.abs(diffHours) >= 0.05) {
@@ -1423,10 +1438,10 @@ router.get('/revenue', async (req, res) => {
       }
     }
 
-    const newClients = newUsersRes.rows.find((r) => r.role === 'homeowner')?.n || 0;
-    const newProvs = newUsersRes.rows.find((r) => r.role === 'provider')?.n || 0;
-    const prevNewClients = prevNewUsersRes.rows.find((r) => r.role === 'homeowner')?.n || 0;
-    const prevNewProvs = prevNewUsersRes.rows.find((r) => r.role === 'provider')?.n || 0;
+    const newClients = userRes.rows.find((r) => r.role === 'homeowner')?.n_cur || 0;
+    const newProvs = userRes.rows.find((r) => r.role === 'provider')?.n_cur || 0;
+    const prevNewClients = userRes.rows.find((r) => r.role === 'homeowner')?.n_prev || 0;
+    const prevNewProvs = userRes.rows.find((r) => r.role === 'provider')?.n_prev || 0;
     const deltaNewClients = pctDelta(newClients, prevNewClients);
     const deltaNewProvs = pctDelta(newProvs, prevNewProvs);
 
@@ -1435,7 +1450,7 @@ router.get('/revenue', async (req, res) => {
 
     // Top 5 categories by job count; the rest collapse into "Other" (mirrors
     // the dashboard's original fixed-7-row layout).
-    const catRows = categoriesRes.rows;
+    const catRows = agg.categories_json || [];
     const topCats = catRows.slice(0, 5);
     const otherCount = catRows.slice(5).reduce((sum, r) => sum + r.n, 0);
     const categories = topCats.map((r, i) => ({
@@ -1447,10 +1462,10 @@ router.get('/revenue', async (req, res) => {
       categories.push({ name: 'Other', val: otherCount, pct: jobs ? Math.round((otherCount / jobs) * 100) : 0, color: CATEGORY_OTHER_COLOR });
     }
 
-    const quotedCount = quotedCountRes.rows[0].n || 0;
-    const acceptedCount = acceptedCountRes.rows[0].n || 0;
-    const paidCount = paidCountRes.rows[0].n || 0;
-    const completedCount = completedCountRes.rows[0].n || 0;
+    const quotedCount = tr.quoted_count || 0;
+    const acceptedCount = tr.accepted_count || 0;
+    const paidCount = tr.paid_count || 0;
+    const completedCount = tr.completed_count || 0;
     const pctOf = (n) => (jobs ? Math.round((n / jobs) * 100) : 0);
     const funnel = [
       { label: 'Jobs posted', n: jobs, pct: 100, color: FUNNEL_COLORS.posted },
@@ -1460,8 +1475,9 @@ router.get('/revenue', async (req, res) => {
       { label: 'Job completed', n: completedCount, pct: pctOf(completedCount), color: FUNNEL_COLORS.completed },
     ];
 
-    const urgencyCounts = Object.fromEntries(urgencyRes.rows.map((r) => [r.urgency, r.n]));
-    const urgencyTotal = urgencyRes.rows.reduce((sum, r) => sum + r.n, 0);
+    const urgencyRows = agg.urgency_json || [];
+    const urgencyCounts = Object.fromEntries(urgencyRows.map((r) => [r.urgency, r.n]));
+    const urgencyTotal = urgencyRows.reduce((sum, r) => sum + r.n, 0);
     const urgency = URGENCY_ORDER
       .filter((key) => urgencyCounts[key])
       .map((key) => ({
@@ -1472,7 +1488,7 @@ router.get('/revenue', async (req, res) => {
     const timeSensitivePct = urgencyTotal
       ? Math.round(((urgencyCounts.emergency || 0) + (urgencyCounts.urgent || 0)) / urgencyTotal * 100)
       : 0;
-    const emergencyFirstQuoteSeconds = emergencyFirstQuoteRes.rows[0]?.avg_seconds;
+    const emergencyFirstQuoteSeconds = agg.emergency_first_seconds;
     const urgencyNote = urgencyTotal
       ? `${timeSensitivePct}% time-sensitive` + (emergencyFirstQuoteSeconds != null
           ? ` · avg ${fmtDuration(emergencyFirstQuoteSeconds)} to first Emergency quote`
