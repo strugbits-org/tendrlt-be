@@ -949,18 +949,20 @@ const shapeFeedbackItem = (r) => ({
   name: r.name,
   email: r.email,
   role: toFeedbackRole(r.role),
+  parish: r.parish || null,
   msg: r.message,
   rating: r.rating,
   followUp: r.follow_up,
   date: r.created_at.toISOString().slice(0, 10),
   status: r.status,
+  approvedForDisplay: r.approved_for_display === true,
 });
 
 // GET /api/admin/feedback-submissions
 router.get('/feedback-submissions', async (req, res) => {
   try {
     const r = await db.query(`
-      SELECT id, cat, name, email, role, rating, follow_up, message, status, created_at
+      SELECT id, cat, name, email, role, parish, rating, follow_up, message, status, created_at, approved_for_display
       FROM public.feedback_submissions
       ORDER BY created_at DESC
     `);
@@ -987,6 +989,28 @@ router.patch('/feedback-submissions/:id/status', async (req, res) => {
   } catch (err) {
     console.error('PATCH /api/admin/feedback-submissions/:id/status error:', err);
     res.status(500).json({ success: false, message: 'Failed to update status.' });
+  }
+});
+
+// PATCH /api/admin/feedback-submissions/:id/approve-display   body: { approved: boolean }
+// Gates whether a 'feedback'-category submission can appear as a public
+// homepage testimonial (GET /api/feedback/public/testimonials) — off by
+// default so nothing goes live without an admin reviewing it first.
+router.patch('/feedback-submissions/:id/approve-display', async (req, res) => {
+  const { approved } = req.body || {};
+  if (typeof approved !== 'boolean') {
+    return res.status(400).json({ success: false, message: 'approved must be a boolean.' });
+  }
+  try {
+    const r = await db.query(
+      `UPDATE public.feedback_submissions SET approved_for_display = $2 WHERE id = $1 RETURNING id`,
+      [req.params.id, approved]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Submission not found.' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('PATCH /api/admin/feedback-submissions/:id/approve-display error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update display approval.' });
   }
 });
 
@@ -1229,10 +1253,10 @@ router.patch('/fee-config/minimums', async (req, res) => {
 
 // ============================================================
 // GET /api/admin/revenue?period=30d
-// Real platform revenue from public.transactions (recorded on quote accept —
-// WiPay deferred, status 'held'; no money moves yet). Returns money fields the
-// admin dashboard revenue widgets merge over their mock period row; activity /
-// growth metrics remain mock until separately wired.
+// Real platform-overview data for the admin Dashboard, from
+// public.transactions/tenders/quotes/users/provider_profiles. Returns the
+// full set of fields the dashboard's revenue, activity, growth, category,
+// funnel, and urgency widgets need — no mock data left once this responds.
 // See documentation/PAYMENTS_AND_JOB_WORKFLOW.md.
 // ============================================================
 const REVENUE_WINDOWS = { '7d': 7, '30d': 30, '90d': 90, '1y': 365, all: null };
@@ -1245,9 +1269,28 @@ const compactMoney = (cents) => {
 };
 const fullMoney = (cents) => Math.round((cents || 0) / 100).toLocaleString('en-US');
 
+// Formats a duration in seconds as "Xh" (<48h) or "X.Yd" otherwise — matches
+// the dashboard's existing "16h"/"18h" style for realistic accept times.
+const fmtDuration = (seconds) => {
+  if (seconds == null || !Number.isFinite(Number(seconds))) return '—';
+  const hours = Number(seconds) / 3600;
+  if (hours < 48) return Math.max(0, Math.round(hours)) + 'h';
+  return (hours / 24).toFixed(1) + 'd';
+};
+
+const CATEGORY_COLORS = ['var(--sage-mid)', 'var(--blue)', 'var(--amber)', 'var(--purple)', '#34d399', '#f87171'];
+const CATEGORY_OTHER_COLOR = '#475569';
+
+const FUNNEL_COLORS = { posted: '#4ade80', quoted: '#22c55e', accepted: '#fbbf24', paid: '#60a5fa', completed: '#a78bfa' };
+
+const URGENCY_LABELS = { emergency: 'Emergency', urgent: 'Urgent', soon: 'Soon', flexible: 'Flexible', planning: 'Planning ahead' };
+const URGENCY_COLORS = { emergency: '#f87171', urgent: '#fb923c', soon: '#fbbf24', flexible: '#60a5fa', planning: '#a78bfa' };
+const URGENCY_ORDER = ['emergency', 'urgent', 'soon', 'flexible', 'planning'];
+
 router.get('/revenue', async (req, res) => {
   const period = REVENUE_WINDOWS.hasOwnProperty(req.query.period) ? req.query.period : '30d';
   const days = REVENUE_WINDOWS[period]; // null = all-time
+  const windowCond = `($1::int IS NULL OR created_at >= NOW() - (INTERVAL '1 day' * $1))`;
   try {
     const sums = `
       SELECT COALESCE(SUM(amount),0)::bigint       AS gmv,
@@ -1260,21 +1303,102 @@ router.get('/revenue', async (req, res) => {
       -- paid — exclude unpaid/abandoned attempts from platform revenue.
       WHERE status NOT IN ('awaiting_payment', 'payment_failed')`;
 
-    const current = await db.query(
-      `${sums} AND ($1::int IS NULL OR created_at >= NOW() - (INTERVAL '1 day' * $1))`,
-      [days]
-    );
-    const c = current.rows[0];
+    // Consolidated into 6 queries (down from 18) using FILTER(WHERE ...) for
+    // current/previous-window pairs and json_agg subqueries for the two
+    // GROUP BY breakdowns — each one firing 16-18 queries in parallel was
+    // exhausting the connection pool (max: 10) and causing intermittent
+    // ETIMEDOUTs under load, which made the whole endpoint fail and silently
+    // fall back to stale mock data on the frontend.
+    const [revRes, tenderRes, quoteRes, userRes, totalsRes, aggRes] = await Promise.all([
+      db.query(`
+        SELECT
+          COALESCE(SUM(amount)       FILTER (WHERE ${windowCond}), 0)::bigint AS gmv,
+          COALESCE(SUM(client_fee)   FILTER (WHERE ${windowCond}), 0)::bigint AS cfee,
+          COALESCE(SUM(provider_fee) FILTER (WHERE ${windowCond}), 0)::bigint AS pfee,
+          COALESCE(SUM(platform_fee) FILTER (WHERE ${windowCond}), 0)::bigint AS rev,
+          COUNT(*)                    FILTER (WHERE ${windowCond})::int AS done,
+          COALESCE(SUM(platform_fee) FILTER (WHERE $1::int IS NOT NULL AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1)), 0)::bigint AS prev_rev,
+          COUNT(*)                    FILTER (WHERE $1::int IS NOT NULL AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1))::int AS prev_done
+        FROM public.transactions
+        WHERE status NOT IN ('awaiting_payment', 'payment_failed')
+      `, [days]),
+      db.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE ${windowCond})::int AS jobs,
+          COUNT(*) FILTER (WHERE $1::int IS NOT NULL AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1))::int AS prev_jobs,
+          COUNT(*) FILTER (WHERE quotes_count > 0 AND (${windowCond}))::int AS quoted_count,
+          COUNT(*) FILTER (WHERE status = 'completed' AND (${windowCond}))::int AS completed_count,
+          COUNT(*) FILTER (
+            WHERE (${windowCond})
+              AND EXISTS (SELECT 1 FROM public.quotes q WHERE q.tender_id = tenders.id AND q.status = 'accepted')
+          )::int AS accepted_count,
+          COUNT(*) FILTER (
+            WHERE (${windowCond})
+              AND EXISTS (SELECT 1 FROM public.transactions tx WHERE tx.tender_id = tenders.id AND tx.status NOT IN ('awaiting_payment','payment_failed'))
+          )::int AS paid_count
+        FROM public.tenders
+        WHERE trashed_at IS NULL
+      `, [days]),
+      db.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE $1::int IS NULL OR q.created_at >= NOW() - (INTERVAL '1 day' * $1))::int AS quotes_cur,
+          COUNT(*) FILTER (WHERE $1::int IS NOT NULL AND q.created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND q.created_at < NOW() - (INTERVAL '1 day' * $1))::int AS quotes_prev,
+          AVG(EXTRACT(EPOCH FROM (q.updated_at - t.created_at))) FILTER (
+            WHERE q.status = 'accepted' AND ($1::int IS NULL OR q.updated_at >= NOW() - (INTERVAL '1 day' * $1))
+          )::float AS accept_seconds_cur,
+          AVG(EXTRACT(EPOCH FROM (q.updated_at - t.created_at))) FILTER (
+            WHERE q.status = 'accepted' AND $1::int IS NOT NULL AND q.updated_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND q.updated_at < NOW() - (INTERVAL '1 day' * $1)
+          )::float AS accept_seconds_prev
+        FROM public.quotes q JOIN public.tenders t ON t.id = q.tender_id
+        WHERE t.trashed_at IS NULL
+      `, [days]),
+      db.query(`
+        SELECT role,
+          COUNT(*) FILTER (WHERE ${windowCond})::int AS n_cur,
+          COUNT(*) FILTER (WHERE $1::int IS NOT NULL AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1))::int AS n_prev
+        FROM public.users
+        WHERE role IN ('homeowner','provider')
+        GROUP BY role
+      `, [days]),
+      db.query(`
+        SELECT
+          (SELECT COUNT(*) FROM public.users WHERE role = 'homeowner')::int AS total_clients,
+          (SELECT COUNT(*) FROM public.users WHERE role = 'provider')::int AS total_providers,
+          (SELECT COUNT(*) FROM public.provider_profiles WHERE verification_status = 'approved')::int AS verified_providers,
+          (SELECT COUNT(*) FROM public.provider_profiles WHERE is_onboarding_complete = TRUE AND verification_status = 'pending')::int AS pending_verification
+      `),
+      db.query(`
+        SELECT
+          (SELECT json_agg(x) FROM (
+            SELECT urgency, COUNT(*)::int AS n
+            FROM public.tenders
+            WHERE trashed_at IS NULL AND (${windowCond})
+            GROUP BY urgency
+          ) x) AS urgency_json,
+          (SELECT json_agg(x) FROM (
+            SELECT COALESCE(st.display_name, t.category::text) AS name, COUNT(*)::int AS n
+            FROM public.tenders t LEFT JOIN public.service_types st ON st.id = t.service_type_id
+            WHERE t.trashed_at IS NULL AND ($1::int IS NULL OR t.created_at >= NOW() - (INTERVAL '1 day' * $1))
+            GROUP BY 1 ORDER BY n DESC
+          ) x) AS categories_json,
+          (
+            SELECT AVG(EXTRACT(EPOCH FROM (fq.first_at - t2.created_at)))::float
+            FROM public.tenders t2
+            JOIN LATERAL (SELECT MIN(created_at) AS first_at FROM public.quotes WHERE tender_id = t2.id) fq ON fq.first_at IS NOT NULL
+            WHERE t2.urgency = 'emergency' AND t2.trashed_at IS NULL AND ($1::int IS NULL OR t2.created_at >= NOW() - (INTERVAL '1 day' * $1))
+          ) AS emergency_first_seconds
+      `, [days]),
+    ]);
+
+    const c = revRes.rows[0];
+    const tr = tenderRes.rows[0];
+    const qr = quoteRes.rows[0];
+    const agg = aggRes.rows[0];
 
     // Delta vs the immediately preceding window of equal length (skip for all-time).
     let deltaRev = '—';
     if (days !== null) {
-      const prev = await db.query(
-        `${sums} AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2)
-                   AND created_at <  NOW() - (INTERVAL '1 day' * $1)`,
-        [days]
-      );
-      const prevRev = Number(prev.rows[0].rev);
+      const prevRev = Number(c.prev_rev);
       const curRev = Number(c.rev);
       if (prevRev > 0) {
         const pct = ((curRev - prevRev) / prevRev) * 100;
@@ -1285,6 +1409,96 @@ router.get('/revenue', async (req, res) => {
     }
 
     const done = c.done || 0;
+    const jobs = tr.jobs || 0;
+    const quotes = qr.quotes_cur || 0;
+
+    // Period-over-period % change — same "vs previous window of equal
+    // length" logic as deltaRev above, for the three Activity KPI cards.
+    const pctDelta = (curVal, prevVal) => {
+      if (days === null) return '—';
+      if (prevVal > 0) {
+        const pct = ((curVal - prevVal) / prevVal) * 100;
+        return `${pct >= 0 ? '↑' : '↓'} ${Math.abs(pct).toFixed(1)}%`;
+      }
+      return curVal > 0 ? '↑ new' : '—';
+    };
+    const deltaJobs = pctDelta(jobs, tr.prev_jobs || 0);
+    const deltaQuotes = pctDelta(quotes, qr.quotes_prev || 0);
+    const deltaDone = pctDelta(done, c.prev_done || 0);
+
+    const acceptSeconds = qr.accept_seconds_cur;
+    let deltaTime = '—';
+    const prevAcceptSeconds = qr.accept_seconds_prev;
+    if (acceptSeconds != null && prevAcceptSeconds != null) {
+      const diffHours = (prevAcceptSeconds - acceptSeconds) / 3600;
+      if (Math.abs(diffHours) >= 0.05) {
+        deltaTime = diffHours >= 0
+          ? `↓ ${diffHours.toFixed(1)}h faster`
+          : `↑ ${Math.abs(diffHours).toFixed(1)}h slower`;
+      }
+    }
+
+    const newClients = userRes.rows.find((r) => r.role === 'homeowner')?.n_cur || 0;
+    const newProvs = userRes.rows.find((r) => r.role === 'provider')?.n_cur || 0;
+    const prevNewClients = userRes.rows.find((r) => r.role === 'homeowner')?.n_prev || 0;
+    const prevNewProvs = userRes.rows.find((r) => r.role === 'provider')?.n_prev || 0;
+    const deltaNewClients = pctDelta(newClients, prevNewClients);
+    const deltaNewProvs = pctDelta(newProvs, prevNewProvs);
+
+    const t = totalsRes.rows[0];
+    const verifiedPct = t.total_providers ? Math.round((t.verified_providers / t.total_providers) * 100) : 0;
+
+    // Top 5 categories by job count; the rest collapse into "Other" (mirrors
+    // the dashboard's original fixed-7-row layout).
+    const catRows = agg.categories_json || [];
+    const topCats = catRows.slice(0, 5);
+    const otherCount = catRows.slice(5).reduce((sum, r) => sum + r.n, 0);
+    const categories = topCats.map((r, i) => ({
+      name: r.name, val: r.n,
+      pct: jobs ? Math.round((r.n / jobs) * 100) : 0,
+      color: CATEGORY_COLORS[i % CATEGORY_COLORS.length],
+    }));
+    if (otherCount > 0) {
+      categories.push({ name: 'Other', val: otherCount, pct: jobs ? Math.round((otherCount / jobs) * 100) : 0, color: CATEGORY_OTHER_COLOR });
+    }
+
+    const quotedCount = tr.quoted_count || 0;
+    const acceptedCount = tr.accepted_count || 0;
+    const paidCount = tr.paid_count || 0;
+    const completedCount = tr.completed_count || 0;
+    const pctOf = (n) => (jobs ? Math.round((n / jobs) * 100) : 0);
+    const funnel = [
+      { label: 'Jobs posted', n: jobs, pct: 100, color: FUNNEL_COLORS.posted },
+      { label: 'Quotes received', n: quotedCount, pct: pctOf(quotedCount), color: FUNNEL_COLORS.quoted },
+      { label: 'Quotes accepted', n: acceptedCount, pct: pctOf(acceptedCount), color: FUNNEL_COLORS.accepted },
+      { label: 'Payment received', n: paidCount, pct: pctOf(paidCount), color: FUNNEL_COLORS.paid },
+      { label: 'Job completed', n: completedCount, pct: pctOf(completedCount), color: FUNNEL_COLORS.completed },
+    ];
+
+    const urgencyRows = agg.urgency_json || [];
+    const urgencyCounts = Object.fromEntries(urgencyRows.map((r) => [r.urgency, r.n]));
+    const urgencyTotal = urgencyRows.reduce((sum, r) => sum + r.n, 0);
+    const urgency = URGENCY_ORDER
+      .filter((key) => urgencyCounts[key])
+      .map((key) => ({
+        label: URGENCY_LABELS[key], count: urgencyCounts[key],
+        pct: urgencyTotal ? Math.round((urgencyCounts[key] / urgencyTotal) * 100) : 0,
+        color: URGENCY_COLORS[key],
+      }));
+    const timeSensitivePct = urgencyTotal
+      ? Math.round(((urgencyCounts.emergency || 0) + (urgencyCounts.urgent || 0)) / urgencyTotal * 100)
+      : 0;
+    const emergencyFirstQuoteSeconds = agg.emergency_first_seconds;
+    const urgencyNote = urgencyTotal
+      ? `${timeSensitivePct}% time-sensitive` + (emergencyFirstQuoteSeconds != null
+          ? ` · avg ${fmtDuration(emergencyFirstQuoteSeconds)} to first Emergency quote`
+          : '')
+      : 'No tenders in this period yet.';
+
+    const cfeeNum = Number(c.cfee), pfeeNum = Number(c.pfee);
+    const feeTotal = cfeeNum + pfeeNum;
+    const clientPct = feeTotal ? Math.round((cfeeNum / feeTotal) * 100) : 50;
+
     res.json({
       success: true,
       revenue: {
@@ -1298,6 +1512,29 @@ router.get('/revenue', async (req, res) => {
         fee_provs: fullMoney(c.pfee),
         fee_per_job: done ? 'J$' + fullMoney(Number(c.rev) / done) : 'J$0',
         avg_gmv: done ? 'J$' + fullMoney(Number(c.gmv) / done) : 'J$0',
+        jobs,
+        quotes,
+        accept_time: fmtDuration(acceptSeconds),
+        delta_time: deltaTime,
+        delta_jobs: deltaJobs,
+        delta_quotes: deltaQuotes,
+        delta_done: deltaDone,
+        new_clients: newClients,
+        new_provs: newProvs,
+        delta_new_clients: deltaNewClients,
+        delta_new_provs: deltaNewProvs,
+        avgQuotesPerJob: jobs ? (quotes / jobs).toFixed(1) : '0.0',
+        totalClients: t.total_clients,
+        totalProviders: t.total_providers,
+        verifiedProviders: t.verified_providers,
+        verifiedProvidersPct: verifiedPct,
+        pendingVerification: t.pending_verification,
+        categories,
+        funnel,
+        urgency,
+        urgencyNote,
+        clientPct,
+        providerPct: 100 - clientPct,
       },
     });
   } catch (err) {
