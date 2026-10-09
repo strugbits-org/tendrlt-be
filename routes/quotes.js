@@ -16,6 +16,72 @@ const router = express.Router();
 
 const VALID_TIMELINES = ['same_day', 'next_day', '2_3_days', 'within_1_week', '1_2_weeks', '2_4_weeks'];
 
+// Fastest-first ranking for the public "Fastest" sort below.
+const TIMELINE_RANK = `CASE q.timeline
+  WHEN 'same_day' THEN 0 WHEN 'next_day' THEN 1 WHEN '2_3_days' THEN 2
+  WHEN 'within_1_week' THEN 3 WHEN '1_2_weeks' THEN 4 WHEN '2_4_weeks' THEN 5 ELSE 6 END`;
+
+// ============================================================
+// GET /api/quotes/public/featured — PUBLIC, no auth. Up to 3 real, live
+// quotes for the homepage "Quote Comparison" showcase section. Read-only —
+// there is intentionally no accept/reject action here, since an anonymous
+// visitor has no tender to accept against. Declared before any '/:id'-style
+// route would capture it (mirrors routes/tenders.js's own public routes).
+// ============================================================
+router.get('/public/featured', async (req, res) => {
+  const sort = ['best', 'price', 'fastest'].includes(req.query.sort) ? req.query.sort : 'newest';
+  const orderBy = {
+    best:    'avg_rating DESC NULLS LAST, review_count DESC NULLS LAST, q.created_at DESC',
+    price:   'q.amount ASC, q.created_at DESC',
+    fastest: `${TIMELINE_RANK} ASC, q.amount ASC`,
+    newest:  'q.created_at DESC',
+  }[sort];
+
+  try {
+    const result = await db.query(`
+      SELECT
+        q.id, q.amount, q.timeline, q.message,
+        COALESCE(pp.business_name, u.first_name || ' ' || u.last_name) AS provider_name,
+        pp.years_experience,
+        (pp.documents ? 'insurance') AS has_insurance,
+        COALESCE(st.display_name, t.category::text) AS role,
+        (SELECT ROUND(AVG(rating)::numeric, 1) FROM public.reviews WHERE provider_id = q.provider_id) AS avg_rating,
+        (SELECT COUNT(*)::int FROM public.reviews WHERE provider_id = q.provider_id) AS review_count,
+        (SELECT COUNT(*)::int FROM public.quotes WHERE provider_id = q.provider_id AND status = 'accepted') AS jobs_completed
+      FROM public.quotes q
+      JOIN public.tenders t ON t.id = q.tender_id
+      JOIN public.users u ON u.id = q.provider_id
+      JOIN public.provider_profiles pp ON pp.provider_id = q.provider_id
+      LEFT JOIN public.service_types st ON st.id = t.service_type_id
+      WHERE q.status = 'pending'
+        AND t.status = 'open' AND t.trashed_at IS NULL
+        AND pp.verification_status = 'approved'
+      ORDER BY ${orderBy}
+      LIMIT 3
+    `);
+
+    const quotes = result.rows.map((r) => ({
+      id: r.id,
+      amountCents: r.amount,
+      timeline: r.timeline,
+      message: r.message,
+      providerName: r.provider_name,
+      role: r.role,
+      yearsExperience: r.years_experience,
+      hasInsurance: r.has_insurance === true,
+      avgRating: r.avg_rating != null ? parseFloat(r.avg_rating) : null,
+      reviewCount: r.review_count || 0,
+      jobsCompleted: r.jobs_completed || 0,
+    }));
+
+    res.set('Cache-Control', 'public, max-age=120, stale-while-revalidate=300');
+    res.json({ success: true, sort, quotes });
+  } catch (err) {
+    console.error('GET /api/quotes/public/featured error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load quotes.' });
+  }
+});
+
 // ============================================================
 // POST /api/quotes
 // Provider submits a quote for an open tender.
