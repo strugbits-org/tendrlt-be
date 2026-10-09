@@ -43,7 +43,13 @@ router.get('/me', authenticate, authorize('provider'), async (req, res) => {
     // time) that /provider-profile needs — additive fields only, so the
     // onboarding page (which only reads profile/services/parishes/user)
     // is unaffected.
-    const result = await db.queryAsUser(req.user.id, `
+    // Plain db.query (superuser), not queryAsUser — RLS would otherwise block
+    // the reviews_json subquery's join to the reviewing client's `users` row
+    // (a user can only read their own row under RLS), silently emptying the
+    // reviews list even though the AVG/COUNT scalars above it stay correct.
+    // Security is unaffected: every subquery is already explicitly scoped by
+    // `$1 = req.user.id`, same as GET /tenders/mine's equivalent fix.
+    const result = await db.query(`
       SELECT
         (SELECT to_json(p.*) FROM public.provider_profiles p WHERE p.provider_id = $1) AS profile,
         (

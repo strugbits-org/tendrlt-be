@@ -569,7 +569,11 @@ router.get('/mine', authenticate, authorize('homeowner'), async (req, res) => {
   }
 
   try {
-    const result = await db.queryAsUser(req.user.id, `
+    // Plain db.query (superuser), not queryAsUser — RLS would otherwise block
+    // reading the accepted provider's name via the join below (a user can
+    // only read their own row under RLS). Security is still enforced
+    // explicitly via `WHERE t.client_id = $1`, same pattern as GET /quotes/received.
+    const result = await db.query(`
       SELECT
         t.id, t.display_code, t.status, t.category, t.parish, t.description,
         t.urgency, t.budget_min, t.budget_max, t.created_at,
@@ -592,6 +596,18 @@ router.get('/mine', authenticate, authorize('homeowner'), async (req, res) => {
           SELECT 1 FROM public.transactions tx
           WHERE tx.tender_id = t.id AND tx.provider_completed_at IS NOT NULL
         ) AS provider_marked_done,
+        (
+          SELECT q.provider_id FROM public.quotes q
+          WHERE q.tender_id = t.id AND q.status = 'accepted' LIMIT 1
+        ) AS accepted_provider_id,
+        (
+          SELECT pu.first_name || ' ' || pu.last_name FROM public.quotes q
+          JOIN public.users pu ON pu.id = q.provider_id
+          WHERE q.tender_id = t.id AND q.status = 'accepted' LIMIT 1
+        ) AS accepted_provider_name,
+        EXISTS (
+          SELECT 1 FROM public.reviews r WHERE r.tender_id = t.id AND r.client_id = $1
+        ) AS has_review,
         st.display_name AS service_name,
         st.emoji        AS service_emoji
       FROM public.tenders t
@@ -1138,6 +1154,87 @@ router.patch('/:id/complete', authenticate, authorize('homeowner'), async (req, 
   } catch (err) {
     console.error('PATCH /api/tenders/:id/complete error:', err);
     res.status(500).json({ success: false, message: 'Failed to complete the job.' });
+  }
+});
+
+// ============================================================
+// POST /api/tenders/:id/review   body: { rating: 1-5, comment?: string }
+// Homeowner leaves a review on a completed job. provider_id/quote_id are
+// resolved server-side from the tender's accepted quote — the client only
+// ever sends tender_id + rating + comment. Shows up immediately in the
+// provider's own GET /api/providers/me (avg rating, review list, rating
+// distribution) since that endpoint reads straight from this table.
+// ============================================================
+router.post('/:id/review', authenticate, authorize('homeowner'), async (req, res) => {
+  const { id } = req.params;
+  const ratingRaw = parseInt(req.body?.rating, 10);
+  const comment = typeof req.body?.comment === 'string' ? req.body.comment.trim().slice(0, 1000) : null;
+
+  if (!Number.isInteger(ratingRaw) || ratingRaw < 1 || ratingRaw > 5) {
+    return res.status(400).json({ success: false, message: 'Rating must be a whole number from 1 to 5.' });
+  }
+
+  try {
+    const check = await db.query(`
+      SELECT t.id, t.client_id, t.status,
+             st.display_name AS service_name,
+             (SELECT q.id FROM public.quotes q
+                WHERE q.tender_id = t.id AND q.status = 'accepted' LIMIT 1) AS quote_id,
+             (SELECT q.provider_id FROM public.quotes q
+                WHERE q.tender_id = t.id AND q.status = 'accepted' LIMIT 1) AS provider_id
+      FROM public.tenders t
+      LEFT JOIN public.service_types st ON st.id = t.service_type_id
+      WHERE t.id = $1
+    `, [id]);
+
+    if (check.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Tender not found.' });
+    }
+    const row = check.rows[0];
+    if (row.client_id !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'Forbidden.' });
+    }
+    if (row.status !== 'completed') {
+      return res.status(409).json({ success: false, message: 'You can only review a job once it’s completed.' });
+    }
+    if (!row.quote_id || !row.provider_id) {
+      return res.status(409).json({ success: false, message: 'No accepted quote found for this job.' });
+    }
+
+    let review;
+    try {
+      const inserted = await db.query(`
+        INSERT INTO public.reviews (tender_id, quote_id, client_id, provider_id, rating, comment)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, rating, comment, created_at
+      `, [id, row.quote_id, req.user.id, row.provider_id, ratingRaw, comment]);
+      review = inserted.rows[0];
+    } catch (insertErr) {
+      if (insertErr.code === '23505') {
+        return res.status(409).json({ success: false, message: 'You’ve already reviewed this job.' });
+      }
+      throw insertErr;
+    }
+
+    res.json({ success: true, review });
+
+    // ── Fire-and-forget: tell the provider they got a new review ──────────
+    const serviceName = row.service_name || 'a job';
+    const title = `New ${ratingRaw}★ review`;
+    const body = `You received a ${ratingRaw}-star review for "${serviceName}".`;
+    Promise.allSettled([
+      notifyUser(row.provider_id, 'new-review', { tenderId: id }),
+      db.query(`
+        INSERT INTO public.notifications (user_id, type, title, body, data)
+        VALUES ($1, 'new_review', $2, $3, $4::jsonb)
+      `, [row.provider_id, title, body, JSON.stringify({ tenderId: id })]),
+      sendPushToUser(row.provider_id, {
+        title, body, type: 'new_review', url: '/provider-profile', data: { tender_id: id },
+      }),
+    ]).catch((err) => console.warn('POST /tenders/:id/review — side-effect error:', err.message));
+  } catch (err) {
+    console.error('POST /api/tenders/:id/review error:', err);
+    res.status(500).json({ success: false, message: 'Failed to submit review.' });
   }
 });
 
