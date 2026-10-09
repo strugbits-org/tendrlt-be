@@ -1364,7 +1364,7 @@ router.get('/revenue', async (req, res) => {
         SELECT
           (SELECT COUNT(*) FROM public.users WHERE role = 'homeowner')::int AS total_clients,
           (SELECT COUNT(*) FROM public.users WHERE role = 'provider')::int AS total_providers,
-          (SELECT COUNT(*) FROM public.provider_profiles WHERE verification_status = 'approved')::int AS verified_providers,
+          (SELECT COUNT(*) FROM public.provider_profiles WHERE is_onboarding_complete = TRUE AND verification_status = 'approved')::int AS verified_providers,
           (SELECT COUNT(*) FROM public.provider_profiles WHERE is_onboarding_complete = TRUE AND verification_status = 'pending')::int AS pending_verification
       `),
       db.query(`
@@ -1548,13 +1548,20 @@ router.get('/revenue', async (req, res) => {
 // See documentation/PAYMENTS_AND_JOB_WORKFLOW.md ("Disputes").
 // ============================================================
 
-// How admins can resolve a dispute → the escrow status we record. WiPay is
-// deferred, so no money actually moves; the disputes row is the authoritative
-// record of the outcome (incl. the "split" nuance the enum can't express).
+// How admins can resolve a dispute → the escrow status we record. WiPay
+// refunds are deferred — no refund API call exists anywhere in this codebase
+// yet — so the client's actual refund never moves automatically; the
+// disputes/transactions rows are just the authoritative record of what's owed.
+// Only two real outcomes (per 2026-10 clarification with the client): either
+// the provider is found to have completed the job (full release, same as a
+// normal payout) or the client is found to be right (full refund of the job
+// amount + half the client's platform fee back; TendrIt keeps the other half
+// as a service charge). There is no partial-provider-payout outcome — a
+// provider is only ever paid if completion was actually signaled by both
+// parties, so a disputed job always resolves to either $0 or 100% for them.
 const RESOLUTION_TX_STATUS = {
-  refund: 'refunded',   // client made whole
-  release: 'completed', // provider paid out
-  split: 'completed',   // partial each way; recorded on the dispute row
+  refund: 'refunded',   // client made whole (job + half fee); provider gets $0
+  release: 'completed', // provider paid out in full
 };
 
 // GET /api/admin/disputes
@@ -1593,7 +1600,9 @@ router.get('/disputes', async (req, res) => {
         tx.provider_payout,
         tx.status                            AS transaction_status,
         tx.created_at                        AS accepted_at,
-        tx.provider_completed_at
+        tx.provider_completed_at,
+        tx.wipay_order_id,
+        tx.wipay_transaction_id
       FROM public.disputes d
       JOIN public.transactions tx ON tx.id = d.transaction_id
       JOIN public.tenders t       ON t.id = tx.tender_id
@@ -1657,6 +1666,8 @@ router.get('/disputes', async (req, res) => {
         tenderCreatedAt: r.tender_created_at,
         acceptedAt: r.accepted_at,
         providerCompletedAt: r.provider_completed_at,
+        wipayOrderId: r.wipay_order_id,
+        wipayTransactionId: r.wipay_transaction_id,
         createdAt: r.created_at,
         resolvedAt: r.resolved_at,
       }))
@@ -1688,13 +1699,13 @@ router.post('/disputes/:id/resolve', async (req, res) => {
   const notes = typeof req.body.notes === 'string' ? req.body.notes.trim() : '';
   const txStatus = RESOLUTION_TX_STATUS[resolution];
   if (!txStatus) {
-    return res.status(400).json({ success: false, message: 'Invalid resolution. Use refund, release, or split.' });
+    return res.status(400).json({ success: false, message: 'Invalid resolution. Use refund or release.' });
   }
   try {
     const ctx = await db.query(`
       SELECT d.id, d.status, d.transaction_id, d.client_id, d.provider_id,
              st.display_name AS service_name,
-             tx.amount, tx.client_fee, tx.provider_payout,
+             tx.amount, tx.client_fee, tx.provider_fee, tx.provider_payout,
              cu.email AS client_email, (cu.first_name || ' ' || cu.last_name) AS client_name,
              pu.email AS provider_email, (pu.first_name || ' ' || pu.last_name) AS provider_name,
              t.id AS tender_id
@@ -1720,14 +1731,42 @@ router.post('/disputes/:id/resolve', async (req, res) => {
        WHERE id = $4`,
       [resolution, notes || null, req.user.id, id]
     );
-    await db.query(
-      `UPDATE public.transactions
-         SET status = $1::transaction_status,
-             completed_at = CASE WHEN $1 = 'completed' THEN NOW() ELSE completed_at END,
-             updated_at = NOW()
-       WHERE id = $2`,
-      [txStatus, row.transaction_id]
-    );
+
+    // originalClientFee is captured before any mutation below — needed for the
+    // notification email even after the row's own client_fee is overwritten.
+    const originalClientFee = row.client_fee || 0;
+
+    if (resolution === 'refund') {
+      // Client gets the full job amount back + half of what they paid in
+      // platform fee; TendrIt keeps the other half as a service charge; the
+      // provider gets $0 (they're only ever paid once completion is signaled
+      // by both parties, which didn't happen here). `client_fee` is
+      // overwritten to the KEPT half (not the original fee) so it reflects
+      // TendrIt's actual revenue from this transaction everywhere it's read
+      // (admin revenue's SUM(platform_fee), this dispute's own history row,
+      // etc.) — the refunded half is communicated to the client via email
+      // only, same as every other WiPay refund in this codebase (deferred,
+      // no refund API call exists yet — see documentation/PAYMENTS_AND_JOB_WORKFLOW.md).
+      const keptClientFee = Math.round(originalClientFee / 2);
+      await db.query(
+        `UPDATE public.transactions
+           SET status = 'refunded', updated_at = NOW(),
+               client_fee = $1, provider_fee = 0, provider_payout = 0, platform_fee = $1
+         WHERE id = $2`,
+        [keptClientFee, row.transaction_id]
+      );
+      row.client_fee = keptClientFee; // keep the fire-and-forget email below in sync
+      row.provider_payout = 0;
+    } else {
+      await db.query(
+        `UPDATE public.transactions
+           SET status = $1::transaction_status,
+               completed_at = CASE WHEN $1 = 'completed' THEN NOW() ELSE completed_at END,
+               updated_at = NOW()
+         WHERE id = $2`,
+        [txStatus, row.transaction_id]
+      );
+    }
     // Resolving a dispute closes the job: the tender leaves in_progress so it
     // drops out of the homeowner's "In Progress" and the provider's "Won"
     // buckets and lands in "Completed" for both. (Refund still records the
@@ -1742,22 +1781,18 @@ router.post('/disputes/:id/resolve', async (req, res) => {
     // ── Fire-and-forget: notify both parties ─────────────────────────────
     (async () => {
       const serviceName = row.service_name || 'the job';
-      // Amount surfaced to each party depends on the outcome.
-      const clientTotalCents = (row.amount || 0) + (row.client_fee || 0);
       const fmt = (cents) => Math.round((cents || 0) / 100).toLocaleString('en-US');
+      // Refund = full job amount + the HALF of the client fee not kept by
+      // TendrIt (row.client_fee was overwritten above to the kept half, so
+      // this reads from originalClientFee captured before that mutation).
       const clientAmt =
-        resolution === 'refund' ? fmt(clientTotalCents)
-        : resolution === 'split' ? fmt(Math.round(clientTotalCents / 2))
+        resolution === 'refund' ? fmt((row.amount || 0) + (originalClientFee - Math.round(originalClientFee / 2)))
         : null;
-      const providerAmt =
-        resolution === 'release' ? fmt(row.provider_payout)
-        : resolution === 'split' ? fmt(Math.round((row.provider_payout || 0) / 2))
-        : null;
+      const providerAmt = resolution === 'release' ? fmt(row.provider_payout) : null;
 
       const outcomeLabel = {
-        refund: 'The homeowner has been fully refunded.',
+        refund: 'The homeowner has been refunded the full job amount plus half the platform fee.',
         release: 'The payout has been released to the provider.',
-        split: 'A split resolution was applied (partial refund + partial payout).',
       }[resolution];
 
       const tasks = [

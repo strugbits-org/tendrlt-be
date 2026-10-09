@@ -114,7 +114,9 @@ router.get('/:weekStart', async (req, res) => {
         COUNT(*)::int AS total_count,
         EXISTS (
           SELECT 1 FROM public.provider_payment_details pd
-          WHERE pd.provider_id = tx.provider_id AND pd.account_number_encrypted IS NOT NULL
+          WHERE pd.provider_id = tx.provider_id
+            AND pd.account_number_encrypted IS NOT NULL
+            AND pd.bank_name IS NOT NULL AND pd.transit_code IS NOT NULL
         ) AS has_payment_details,
         array_agg(tx.id) AS transaction_ids
       FROM public.transactions tx
