@@ -18,6 +18,7 @@ const feesRoutes          = require('./routes/fees');
 const webhooksRoutes      = require('./routes/webhooks');
 const chatRoutes          = require('./routes/chat');
 const paymentsRoutes      = require('./routes/payments');
+const adminPayoutsRoutes  = require('./routes/adminPayouts');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -48,6 +49,7 @@ app.use('/api/providers',     providersRoutes);
 app.use('/api/services',      servicesRoutes);
 app.use('/api/tenders',       tendersRoutes);
 app.use('/api/admin',         adminRoutes);
+app.use('/api/admin/payouts', adminPayoutsRoutes);
 app.use('/api/quotes',        quotesRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/push',          pushRoutes);
