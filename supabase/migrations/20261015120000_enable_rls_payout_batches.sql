@@ -9,20 +9,19 @@
 -- closes the public PostgREST path without touching app behavior.
 -- ============================================================
 
--- GRANT rationale: this is NOT covered by the one-time
--- `GRANT ... ON ALL TABLES IN SCHEMA public TO tendrit_app` in
--- 20260605210000_enable_rls.sql — that only applied to tables that existed
--- at that time. Every table created afterward adds its own explicit GRANT
--- in its own migration (see provider_payment_details in
--- 20260713120000_create_provider_payment_details.sql, and
--- chatbot_settings/chatbot_faqs in 20260924120000_create_chatbot_content.sql)
--- — this follows that same established convention. tendrit_app is the role
--- `db.queryAsUser()` connects as elsewhere in the app; no current route uses
--- it for payout_batches specifically (admin routes use the superuser
--- connection instead), so this grant isn't exercised by any code path
--- today — kept for consistency/forward-compatibility, same reasoning as
--- the two examples above.
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.payout_batches TO tendrit_app;
+-- Least privilege, per review feedback: an earlier version of this
+-- migration granted SELECT/INSERT/UPDATE/DELETE on this payout table to
+-- tendrit_app "for consistency" with other tables, even though no current
+-- route uses that role for payout_batches (admin routes use the superuser
+-- connection). On a table holding payout data, forward-compatibility isn't
+-- worth the extra standing privilege — revoking it now; a future migration
+-- can grant exactly what's needed (even just SELECT) if/when a route
+-- actually requires it. This REVOKE is here specifically to undo that
+-- earlier GRANT on the already-applied database, since migrations in this
+-- project are run directly against the live DB rather than tracked/rolled
+-- back by a CLI — editing the GRANT line out of this file alone wouldn't
+-- un-grant what was already applied.
+REVOKE SELECT, INSERT, UPDATE, DELETE ON public.payout_batches FROM tendrit_app;
 
 ALTER TABLE public.payout_batches ENABLE ROW LEVEL SECURITY;
 
@@ -40,6 +39,15 @@ DROP POLICY IF EXISTS "payout_batches_admin_all" ON public.payout_batches;
 -- (NULL = any id) likewise returns NULL, never an error. A NULL result in
 -- a USING/WITH CHECK clause is treated by Postgres as deny, not as an
 -- accidental allow.
+--
+-- current_app_user_role() is also explicitly declared SECURITY DEFINER
+-- (20260605210000_enable_rls.sql) — it runs with its owner's privileges,
+-- not the calling role's, so its internal `SELECT role FROM public.users`
+-- bypasses RLS on `users` entirely. It does not depend on the calling role
+-- (e.g. tendrit_app under queryAsUser) having its own read access to
+-- arbitrary user rows, so admin access through queryAsUser can't silently
+-- see "no role" / be denied just because RLS on `users` would otherwise
+-- block that lookup.
 CREATE POLICY "payout_batches_admin_all" ON public.payout_batches
   FOR ALL
   USING (public.current_app_user_role() = 'admin')
