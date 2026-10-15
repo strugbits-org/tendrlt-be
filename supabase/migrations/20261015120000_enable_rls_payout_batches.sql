@@ -5,8 +5,21 @@
 -- exposes every public-schema table by default unless RLS restricts it.
 -- Admin-only table; the backend only reads/writes it via a superuser
 -- connection that bypasses RLS regardless, so this only closes the public
--- PostgREST path. No rollback path — applied and verified directly
--- against the live DB (see verification notes below each step).
+-- PostgREST path.
+--
+-- Idempotent: every statement below (the guarded REVOKEs, ENABLE ROW
+-- LEVEL SECURITY, DROP POLICY IF EXISTS, CREATE POLICY) is safe to
+-- re-run against a DB that already has this fix applied — re-running
+-- produces the same end state, not an error.
+--
+-- No rollback tooling in this project (migrations are applied directly
+-- against the live DB via scripts/run-migration.js, not tracked/reversed
+-- by a CLI). To manually revert this specific change:
+--   ALTER TABLE public.payout_batches DISABLE ROW LEVEL SECURITY;
+--   DROP POLICY IF EXISTS "payout_batches_admin_all" ON public.payout_batches;
+--   GRANT SELECT, INSERT, UPDATE, DELETE ON public.payout_batches TO tendrit_app;
+-- (Re-granting anon/authenticated is intentionally omitted — nothing
+-- client-side ever depended on that access.)
 -- ============================================================
 
 -- Revoke standing privileges nothing currently needs, rather than leave
@@ -30,12 +43,8 @@ BEGIN
     REVOKE ALL ON public.payout_batches FROM authenticated;
   END IF;
 END $$;
--- Verified: SELECT grantee, privilege_type FROM information_schema.role_table_grants
--- WHERE table_name = 'payout_batches' AND grantee IN ('tendrit_app','anon','authenticated')
--- returns zero rows after this migration runs.
 
 ALTER TABLE public.payout_batches ENABLE ROW LEVEL SECURITY;
--- Verified: SELECT relrowsecurity FROM pg_class WHERE relname = 'payout_batches' -> true.
 
 DROP POLICY IF EXISTS "payout_batches_admin_all" ON public.payout_batches;
 
@@ -50,11 +59,3 @@ CREATE POLICY "payout_batches_admin_all" ON public.payout_batches
   FOR ALL
   USING (public.current_app_user_role() = 'admin')
   WITH CHECK (public.current_app_user_role() = 'admin');
--- Verified against the live DB after this migration ran:
---   1. A real anon-key PostgREST GET to /rest/v1/payout_batches returned [] (empty),
---      not the row that exists in the table.
---   2. A query executed as tendrit_app with app.current_user_id set to a real
---      non-admin (homeowner) user's id also returned zero rows via this policy.
---   3. The app's own admin-authenticated route (GET /api/admin/payouts, which
---      uses the superuser connection, unaffected by RLS either way) still
---      returned correct data, confirming no regression to app behavior.
