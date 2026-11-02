@@ -1275,6 +1275,7 @@ router.get('/fee-config/batch-log', async (req, res) => {
         to_char(date_trunc('week', tx.completed_at), 'YYYY-MM-DD') AS week_start,
         to_char(date_trunc('week', tx.completed_at) + INTERVAL '6 days', 'YYYY-MM-DD') AS week_end,
         EXTRACT(week FROM tx.completed_at)::int AS week_number,
+        EXTRACT(isoyear FROM tx.completed_at)::int AS week_year,
         COUNT(*)::int AS txns,
         COALESCE(SUM(tx.amount), 0)::bigint AS gross_cents,
         COALESCE(SUM(tx.client_fee), 0)::bigint AS client_fee_cents,
@@ -1286,7 +1287,7 @@ router.get('/fee-config/batch-log', async (req, res) => {
       FROM public.transactions tx
       WHERE tx.status = ANY($1::transaction_status[])
         AND tx.completed_at IS NOT NULL
-      GROUP BY 1, 2, 3
+      GROUP BY 1, 2, 3, 4
       ORDER BY week_start DESC
       LIMIT 26
     `, [PAYABLE_STATUSES]);
@@ -1307,7 +1308,10 @@ router.get('/fee-config/batch-log', async (req, res) => {
         : null;
       return {
         id: r.week_start,
-        label: `Week ${r.week_number}`,
+        // EXTRACT(week) is the ISO week number, which is ambiguous on its own
+        // near year boundaries (e.g. late Dec can fall in week 1 of the next
+        // ISO year) — pairing it with EXTRACT(isoyear) disambiguates that.
+        label: `Week ${r.week_number}, ${r.week_year}`,
         dates: `${r.week_start} – ${r.week_end}`,
         txns: r.txns,
         gross: Number(r.gross_cents),

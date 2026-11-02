@@ -204,6 +204,13 @@ router.patch('/mark-paid', async (req, res) => {
 // missing banking details are silently skipped (can't be paid by this
 // file); the count is returned in the X-Skipped-Providers header so the
 // frontend can warn before/after download.
+//
+// Because already-paid providers are included (so re-exporting a paid week
+// isn't just empty), every row carries a Status column (UNPAID / ALREADY
+// PAID / MIXED - PARTIALLY PAID) so re-uploading an already-processed batch
+// to the bank isn't silent — the admin sees it on the row before uploading.
+// The already-fully-paid provider count is also in the X-Already-Paid-Providers
+// header for the frontend to warn on before/after download.
 // ============================================================
 router.get('/:weekStart/export-csv', async (req, res) => {
   const { weekStart } = req.params;
@@ -215,6 +222,8 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       SELECT
         tx.provider_id,
         COALESCE(SUM(tx.provider_payout), 0)::bigint AS provider_payout_cents,
+        bool_and(tx.status = 'paid') AS all_paid,
+        bool_or(tx.status = 'paid') AS any_paid,
         pd.payee_first_name, pd.middle_initial, pd.payee_surname, pd.business_name, pd.account_ownership,
         pd.recipient_id, pd.bank_name, pd.transit_code, pd.account_type,
         pd.account_number_encrypted
@@ -233,6 +242,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
 
     const rows = [];
     let skipped = 0;
+    let alreadyPaidCount = 0;
     for (const r of result.rows) {
       const hasBanking = r.account_number_encrypted && r.bank_name && r.transit_code;
       if (!hasBanking) { skipped++; continue; }
@@ -250,6 +260,13 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         ? r.business_name
         : [r.payee_first_name, r.middle_initial, r.payee_surname].filter(Boolean).join(' ');
 
+      // Re-exporting a week already uploaded/processed risks the admin
+      // re-submitting the same file to the bank and double-paying a
+      // provider — so every row is explicitly marked rather than silently
+      // including already-paid providers alongside still-payable ones.
+      const status = r.all_paid ? 'ALREADY PAID' : r.any_paid ? 'MIXED - PARTIALLY PAID' : 'UNPAID';
+      if (r.all_paid) alreadyPaidCount++;
+
       rows.push([
         payeeName,
         r.recipient_id || '',
@@ -261,6 +278,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         'JMD',
         `TendrIt Payout WK${weekStart}`,
         weekStart,
+        status,
       ]);
     }
 
@@ -287,7 +305,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
 
     const header = [
       'Payee Name', 'Individual ID (TRN)', 'Bank Name', 'Transit Code',
-      'Account Type', 'Account Number', 'Amount', 'Currency', 'Reference', 'Payment Date',
+      'Account Type', 'Account Number', 'Amount', 'Currency', 'Reference', 'Payment Date', 'Status',
     ];
     const csvLines = [header, ...rows].map((row) =>
       row.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')
@@ -297,6 +315,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
     res.set('Content-Type', 'text/csv; charset=utf-8');
     res.set('Content-Disposition', `attachment; filename="tendrit-payout-${weekStart}.csv"`);
     res.set('X-Skipped-Providers', String(skipped));
+    res.set('X-Already-Paid-Providers', String(alreadyPaidCount));
     res.send(csv);
   } catch (err) {
     console.error('GET /api/admin/payouts/:weekStart/export-csv error:', err);

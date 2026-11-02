@@ -36,21 +36,31 @@ function isRateLimited(ip) {
 // the live table, not whatever an admin happened to type — so it's injected
 // as its own authoritative block the model is told to prefer.
 async function loadFeeFacts() {
-  const { rows } = await db.query(
-    `SELECT client_rate, provider_rate, min_client_fee, min_provider_fee, min_fee_enabled
-       FROM public.platform_fee_config WHERE id = 1`
-  );
-  const fc = rows[0];
-  if (!fc) return null;
-  const jmd = (cents) => `J$${Math.round(Number(cents) / 100).toLocaleString()}`;
-  const lines = [
-    `Homeowner/client platform fee: ${Number(fc.client_rate)}% of the job value.`,
-    `Provider platform fee: ${Number(fc.provider_rate)}% deducted from the provider's payout.`,
-  ];
-  if (fc.min_fee_enabled) {
-    lines.push(`A minimum fee floor applies: at least ${jmd(fc.min_client_fee)} (client side) / ${jmd(fc.min_provider_fee)} (provider side) per job, even if the percentage would work out lower.`);
+  // Runs inside loadContext()'s Promise.all alongside the settings/FAQ
+  // queries — an uncaught failure here would reject the whole thing and
+  // take the entire chat endpoint down over a live-rate lookup, instead of
+  // just losing the live-rate accuracy. Caught locally so a DB hiccup here
+  // degrades to the old behaviour (chat still works, minus live fee facts).
+  try {
+    const { rows } = await db.query(
+      `SELECT client_rate, provider_rate, min_client_fee, min_provider_fee, min_fee_enabled
+         FROM public.platform_fee_config WHERE id = 1`
+    );
+    const fc = rows[0];
+    if (!fc) return null;
+    const jmd = (cents) => `J$${Math.round(Number(cents) / 100).toLocaleString()}`;
+    const lines = [
+      `Homeowner/client platform fee: ${Number(fc.client_rate)}% of the job value.`,
+      `Provider platform fee: ${Number(fc.provider_rate)}% deducted from the provider's payout.`,
+    ];
+    if (fc.min_fee_enabled) {
+      lines.push(`A minimum fee floor applies: at least ${jmd(fc.min_client_fee)} (client side) / ${jmd(fc.min_provider_fee)} (provider side) per job, even if the percentage would work out lower.`);
+    }
+    return lines.join('\n');
+  } catch (err) {
+    console.error('loadFeeFacts error (chat will fall back to static context):', err.message);
+    return null;
   }
-  return lines.join('\n');
 }
 
 async function loadContext() {
