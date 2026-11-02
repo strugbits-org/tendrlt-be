@@ -193,8 +193,11 @@ router.patch('/mark-paid', async (req, res) => {
 
 // ============================================================
 // GET /api/admin/payouts/:weekStart/export-csv
-// Generates a Scotiabank-bound EFT batch CSV for a week's still-unpaid
-// payable transactions, grouped by provider. See the field-mapping comment
+// Generates a Scotiabank-bound EFT batch CSV for a week's payable
+// transactions (completed or already paid — same PAYABLE_STATUSES as the
+// summary/detail endpoints above, so a week already marked paid can still
+// be re-exported for records instead of silently returning zero rows),
+// grouped by provider. See the field-mapping comment
 // below — this is a best-effort CSV wrapper over Jamaica's JCBA/ACH PPD
 // Entry Detail fields (documentation/PAYMENTS_AND_JOB_WORKFLOW.md §3), NOT
 // yet confirmed against Scotiabank's actual upload template. Providers
@@ -217,13 +220,13 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         pd.account_number_encrypted
       FROM public.transactions tx
       LEFT JOIN public.provider_payment_details pd ON pd.provider_id = tx.provider_id
-      WHERE tx.status = 'completed'
+      WHERE tx.status = ANY($2::transaction_status[])
         AND tx.completed_at >= $1::date
         AND tx.completed_at < ($1::date + INTERVAL '7 days')
       GROUP BY tx.provider_id, pd.payee_first_name, pd.middle_initial, pd.payee_surname,
                pd.business_name, pd.account_ownership, pd.recipient_id, pd.bank_name,
                pd.transit_code, pd.account_type, pd.account_number_encrypted
-    `, [weekStart]);
+    `, [weekStart, PAYABLE_STATUSES]);
 
     const weekEnd = new Date(weekStart);
     weekEnd.setDate(weekEnd.getDate() + 6);

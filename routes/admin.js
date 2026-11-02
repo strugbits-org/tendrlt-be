@@ -1022,6 +1022,11 @@ router.patch('/feedback-submissions/:id/approve-display', async (req, res) => {
 
 const num = (v) => (v == null ? null : parseFloat(v));
 
+// Matches routes/adminPayouts.js's PAYABLE_STATUSES — a transaction counts
+// toward batch/payout figures once the homeowner confirms completion, not
+// only while still unpaid.
+const PAYABLE_STATUSES = ['completed', 'paid'];
+
 // Map a DB history row to the admin-screen HistoryEntry shape.
 const shapeFeeHistory = (h) => {
   const created = new Date(h.created_at);
@@ -1248,6 +1253,77 @@ router.patch('/fee-config/minimums', async (req, res) => {
   } catch (err) {
     console.error('PATCH /api/admin/fee-config/minimums error:', err);
     res.status(500).json({ success: false, message: 'Failed to update minimum fees.' });
+  }
+});
+
+// ============================================================
+// GET /api/admin/fee-config/batch-log
+// Real per-week fee log for the admin Settings "Payment Batch Fee Log" —
+// replaces the placeholder sample rows. Groups payable transactions
+// (completed or paid, matching the payouts summary) by ISO week and uses
+// each transaction's OWN stored client_fee_rate/provider_fee_rate/
+// client_fee/provider_fee (set at collection time) rather than today's
+// live config, so a week keeps showing the rate that actually applied to
+// it even after the config changes later. "Fee Version" is the
+// fee_change_history code whose new_client/new_provider exactly matches
+// the week's rate pair, if one exists.
+// ============================================================
+router.get('/fee-config/batch-log', async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT
+        to_char(date_trunc('week', tx.completed_at), 'YYYY-MM-DD') AS week_start,
+        to_char(date_trunc('week', tx.completed_at) + INTERVAL '6 days', 'YYYY-MM-DD') AS week_end,
+        EXTRACT(week FROM tx.completed_at)::int AS week_number,
+        COUNT(*)::int AS txns,
+        COALESCE(SUM(tx.amount), 0)::bigint AS gross_cents,
+        COALESCE(SUM(tx.client_fee), 0)::bigint AS client_fee_cents,
+        COALESCE(SUM(tx.provider_fee), 0)::bigint AS provider_fee_cents,
+        -- A week's transactions should share one rate pair (rates only change
+        -- going forward); MIN/MAX both present just surfaces it if they ever don't.
+        MIN(tx.client_fee_rate) AS client_rate_min, MAX(tx.client_fee_rate) AS client_rate_max,
+        MIN(tx.provider_fee_rate) AS provider_rate_min, MAX(tx.provider_fee_rate) AS provider_rate_max
+      FROM public.transactions tx
+      WHERE tx.status = ANY($1::transaction_status[])
+        AND tx.completed_at IS NOT NULL
+      GROUP BY 1, 2, 3
+      ORDER BY week_start DESC
+      LIMIT 26
+    `, [PAYABLE_STATUSES]);
+
+    if (result.rows.length === 0) {
+      return res.json({ success: true, batches: [] });
+    }
+
+    const history = (await db.query(
+      `SELECT code, new_client, new_provider FROM public.fee_change_history ORDER BY created_at DESC`
+    )).rows;
+
+    const batches = result.rows.map((r) => {
+      const clientRate = r.client_rate_min === r.client_rate_max ? r.client_rate_min : `${r.client_rate_min}–${r.client_rate_max}`;
+      const providerRate = r.provider_rate_min === r.provider_rate_max ? r.provider_rate_min : `${r.provider_rate_min}–${r.provider_rate_max}`;
+      const match = r.client_rate_min === r.client_rate_max && r.provider_rate_min === r.provider_rate_max
+        ? history.find((h) => num(h.new_client) === num(r.client_rate_min) && num(h.new_provider) === num(r.provider_rate_min))
+        : null;
+      return {
+        id: r.week_start,
+        label: `Week ${r.week_number}`,
+        dates: `${r.week_start} – ${r.week_end}`,
+        txns: r.txns,
+        gross: Number(r.gross_cents),
+        clientRate,
+        providerRate,
+        feeVersion: match ? match.code : '—',
+        clientFees: Number(r.client_fee_cents),
+        provFees: Number(r.provider_fee_cents),
+        totalRev: Number(r.client_fee_cents) + Number(r.provider_fee_cents),
+      };
+    });
+
+    res.json({ success: true, batches });
+  } catch (err) {
+    console.error('GET /api/admin/fee-config/batch-log error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load fee batch log.' });
   }
 });
 

@@ -28,11 +28,37 @@ function isRateLimited(ip) {
   return timestamps.length > RATE_LIMIT_MAX;
 }
 
+// Fee rates/minimums live in platform_fee_config and change over time (see
+// routes/admin.js's fee-config endpoints); chatbot_settings.policies and
+// chatbot_faqs are free text an admin typed once and will drift out of sync
+// with the real rate whenever it's updated (confirmed: policies said
+// "9.5%/12%" while live config was 12%/14.8%). Fee questions must always use
+// the live table, not whatever an admin happened to type — so it's injected
+// as its own authoritative block the model is told to prefer.
+async function loadFeeFacts() {
+  const { rows } = await db.query(
+    `SELECT client_rate, provider_rate, min_client_fee, min_provider_fee, min_fee_enabled
+       FROM public.platform_fee_config WHERE id = 1`
+  );
+  const fc = rows[0];
+  if (!fc) return null;
+  const jmd = (cents) => `J$${Math.round(Number(cents) / 100).toLocaleString()}`;
+  const lines = [
+    `Homeowner/client platform fee: ${Number(fc.client_rate)}% of the job value.`,
+    `Provider platform fee: ${Number(fc.provider_rate)}% deducted from the provider's payout.`,
+  ];
+  if (fc.min_fee_enabled) {
+    lines.push(`A minimum fee floor applies: at least ${jmd(fc.min_client_fee)} (client side) / ${jmd(fc.min_provider_fee)} (provider side) per job, even if the percentage would work out lower.`);
+  }
+  return lines.join('\n');
+}
+
 async function loadContext() {
-  const [settingsRes, faqsRes] = await Promise.all([
+  const [settingsRes, faqsRes, feeFacts] = await Promise.all([
     db.query('SELECT company_name, tagline, about, policies, extra_notes FROM public.chatbot_settings WHERE id = 1'),
     db.query(`SELECT question, answer FROM public.chatbot_faqs
                 WHERE is_active = TRUE ORDER BY display_order ASC, created_at ASC`),
+    loadFeeFacts(),
   ]);
 
   const settings = settingsRes.rows[0] || {};
@@ -41,6 +67,9 @@ async function loadContext() {
   const parts = [];
   if (settings.company_name || settings.tagline) {
     parts.push(`${settings.company_name || 'TendrIt'}${settings.tagline ? ' — ' + settings.tagline : ''}`);
+  }
+  if (feeFacts) {
+    parts.push(`LIVE FEE RATES (authoritative — current as of right now; use these exact numbers for any fee question and ignore any conflicting rate mentioned elsewhere in this context):\n${feeFacts}`);
   }
   if (settings.about) parts.push(`ABOUT:\n${settings.about}`);
   if (settings.policies) parts.push(`POLICIES:\n${settings.policies}`);
