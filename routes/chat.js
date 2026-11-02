@@ -28,11 +28,52 @@ function isRateLimited(ip) {
   return timestamps.length > RATE_LIMIT_MAX;
 }
 
+// Fee rates/minimums live in platform_fee_config and change over time (see
+// routes/admin.js's fee-config endpoints); chatbot_settings.policies and
+// chatbot_faqs are free text an admin typed once and will drift out of sync
+// with the real rate whenever it's updated (confirmed: policies said
+// "9.5%/12%" while live config was 12%/14.8%). Fee questions must always use
+// the live table, not whatever an admin happened to type — so it's injected
+// as its own authoritative block the model is told to prefer.
+async function loadFeeFacts() {
+  // Runs inside loadContext()'s Promise.all alongside the settings/FAQ
+  // queries — an uncaught failure here would reject the whole thing and
+  // take the entire chat endpoint down over a live-rate lookup, instead of
+  // just losing the live-rate accuracy. Caught locally so a DB hiccup here
+  // degrades to the old behaviour (chat still works, minus live fee facts).
+  try {
+    const { rows } = await db.query(
+      `SELECT client_rate, provider_rate, min_client_fee, min_provider_fee, min_fee_enabled
+         FROM public.platform_fee_config WHERE id = 1`
+    );
+    const fc = rows[0];
+    // Number(null) is 0, not NaN — without this check a null rate would make
+    // the bot confidently state a 0% fee instead of omitting the fact.
+    if (!fc || fc.client_rate == null || fc.provider_rate == null) return null;
+    const jmd = (cents) => `J$${Math.round(Number(cents) / 100).toLocaleString()}`;
+    const lines = [
+      `Homeowner/client platform fee: ${Number(fc.client_rate)}% of the job value.`,
+      `Provider platform fee: ${Number(fc.provider_rate)}% deducted from the provider's payout.`,
+    ];
+    // Same Number(null) === 0 risk as the rates above: if the floor is
+    // enabled but one of the amounts is unset, skip the line rather than
+    // stating a false "at least J$0" minimum.
+    if (fc.min_fee_enabled && fc.min_client_fee != null && fc.min_provider_fee != null) {
+      lines.push(`A minimum fee floor applies: at least ${jmd(fc.min_client_fee)} (client side) / ${jmd(fc.min_provider_fee)} (provider side) per job, even if the percentage would work out lower.`);
+    }
+    return lines.join('\n');
+  } catch (err) {
+    console.error('loadFeeFacts error (chat will fall back to static context):', err.message);
+    return null;
+  }
+}
+
 async function loadContext() {
-  const [settingsRes, faqsRes] = await Promise.all([
+  const [settingsRes, faqsRes, feeFacts] = await Promise.all([
     db.query('SELECT company_name, tagline, about, policies, extra_notes FROM public.chatbot_settings WHERE id = 1'),
     db.query(`SELECT question, answer FROM public.chatbot_faqs
                 WHERE is_active = TRUE ORDER BY display_order ASC, created_at ASC`),
+    loadFeeFacts(),
   ]);
 
   const settings = settingsRes.rows[0] || {};
@@ -41,6 +82,9 @@ async function loadContext() {
   const parts = [];
   if (settings.company_name || settings.tagline) {
     parts.push(`${settings.company_name || 'TendrIt'}${settings.tagline ? ' — ' + settings.tagline : ''}`);
+  }
+  if (feeFacts) {
+    parts.push(`LIVE FEE RATES (authoritative — current as of right now; use these exact numbers for any fee question and ignore any conflicting rate mentioned elsewhere in this context):\n${feeFacts}`);
   }
   if (settings.about) parts.push(`ABOUT:\n${settings.about}`);
   if (settings.policies) parts.push(`POLICIES:\n${settings.policies}`);
