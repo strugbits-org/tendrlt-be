@@ -284,10 +284,13 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       // full account number — only the bank-upload file (below) needs it
       // verbatim. Masking everything but the last 4 digits here limits
       // exposure if this file is ever shared/stored less carefully than
-      // the actual bank file.
+      // the actual bank file. Plain '*' rather than a UTF-8 bullet: this
+      // CSV has no BOM, and Excel (which ignores the Content-Type charset
+      // for a downloaded file) would otherwise render a multi-byte
+      // character as mojibake.
       if (includePaid && accountNumber) {
         const digits = String(accountNumber);
-        accountNumber = digits.length <= 4 ? digits : '•'.repeat(digits.length - 4) + digits.slice(-4);
+        accountNumber = digits.length <= 4 ? digits : '*'.repeat(digits.length - 4) + digits.slice(-4);
       }
 
       const payeeName = r.account_ownership === 'business' && r.business_name
@@ -337,8 +340,20 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       );
     } else {
       // Not a payout_batches write (this isn't a bank submission), but
-      // still bank account data leaving the system — log who pulled it
-      // and when, same as any other export of sensitive records.
+      // still bank account data leaving the system — recorded durably
+      // (payout_csv_export_log, see its migration) rather than only
+      // console.log, which is lost on log rotation/restart. Best-effort:
+      // a logging failure shouldn't block an admin from getting their
+      // export, so it's caught and reported separately from the main
+      // try/catch's "Failed to generate CSV" response.
+      try {
+        await db.query(
+          `INSERT INTO public.payout_csv_export_log (week_start, admin_id) VALUES ($1, $2)`,
+          [weekStart, req.user.id]
+        );
+      } catch (logErr) {
+        console.error('Failed to record payout_csv_export_log entry:', logErr.message);
+      }
       console.log(`Records-mode payout CSV exported for week ${weekStart} by admin ${req.user.id} at ${new Date().toISOString()}`);
     }
 
@@ -356,7 +371,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       // it's still easy to mistake for the bank file at a glance. This
       // banner is a harmless extra "column" to any real CSV parser/bank
       // template, since it never reaches the bank-upload path.
-      csvLines.unshift('"FOR INTERNAL RECORDS ONLY — DO NOT UPLOAD TO BANK"');
+      csvLines.unshift('"FOR INTERNAL RECORDS ONLY - DO NOT UPLOAD TO BANK"');
     }
     const csv = csvLines.join('\r\n');
 
