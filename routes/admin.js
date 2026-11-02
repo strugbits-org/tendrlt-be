@@ -17,6 +17,7 @@ const {
 } = require('../lib/disputeEmails');
 const { jamaicaToday } = require('../lib/feeConfig');
 const paymentCrypto = require('../lib/paymentCrypto');
+const { PAYABLE_STATUSES } = require('../lib/payoutStatuses');
 
 const router = express.Router();
 
@@ -1022,11 +1023,6 @@ router.patch('/feedback-submissions/:id/approve-display', async (req, res) => {
 
 const num = (v) => (v == null ? null : parseFloat(v));
 
-// Matches routes/adminPayouts.js's PAYABLE_STATUSES — a transaction counts
-// toward batch/payout figures once the homeowner confirms completion, not
-// only while still unpaid.
-const PAYABLE_STATUSES = ['completed', 'paid'];
-
 // Map a DB history row to the admin-screen HistoryEntry shape.
 const shapeFeeHistory = (h) => {
   const created = new Date(h.created_at);
@@ -1300,11 +1296,24 @@ router.get('/fee-config/batch-log', async (req, res) => {
       `SELECT code, new_client, new_provider FROM public.fee_change_history ORDER BY created_at DESC`
     )).rows;
 
+    // MIN/MAX come back as strings (NUMERIC columns) and can be null — older
+    // transactions from before client_fee_rate/provider_fee_rate existed
+    // have no stored rate. Compare via num() rather than the raw strings,
+    // and handle null explicitly, instead of risking a literal "null–X"
+    // range string if only some of a week's rows have a stored rate.
+    const formatRate = (minRaw, maxRaw) => {
+      const nMin = num(minRaw), nMax = num(maxRaw);
+      if (nMin == null && nMax == null) return null;
+      if (nMin != null && nMin === nMax) return minRaw;
+      return `${nMin != null ? nMin : '—'}–${nMax != null ? nMax : '—'}`;
+    };
     const batches = result.rows.map((r) => {
-      const clientRate = r.client_rate_min === r.client_rate_max ? r.client_rate_min : `${r.client_rate_min}–${r.client_rate_max}`;
-      const providerRate = r.provider_rate_min === r.provider_rate_max ? r.provider_rate_min : `${r.provider_rate_min}–${r.provider_rate_max}`;
-      const match = r.client_rate_min === r.client_rate_max && r.provider_rate_min === r.provider_rate_max
-        ? history.find((h) => num(h.new_client) === num(r.client_rate_min) && num(h.new_provider) === num(r.provider_rate_min))
+      const clientRate = formatRate(r.client_rate_min, r.client_rate_max);
+      const providerRate = formatRate(r.provider_rate_min, r.provider_rate_max);
+      const nClientRate = num(r.client_rate_min), nProviderRate = num(r.provider_rate_min);
+      const match = nClientRate != null && nClientRate === num(r.client_rate_max)
+        && nProviderRate != null && nProviderRate === num(r.provider_rate_max)
+        ? history.find((h) => num(h.new_client) === nClientRate && num(h.new_provider) === nProviderRate)
         : null;
       return {
         id: r.week_start,

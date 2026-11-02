@@ -55,7 +55,10 @@ async function loadFeeFacts() {
       `Homeowner/client platform fee: ${Number(fc.client_rate)}% of the job value.`,
       `Provider platform fee: ${Number(fc.provider_rate)}% deducted from the provider's payout.`,
     ];
-    if (fc.min_fee_enabled) {
+    // Same Number(null) === 0 risk as the rates above: if the floor is
+    // enabled but one of the amounts is unset, skip the line rather than
+    // stating a false "at least J$0" minimum.
+    if (fc.min_fee_enabled && fc.min_client_fee != null && fc.min_provider_fee != null) {
       lines.push(`A minimum fee floor applies: at least ${jmd(fc.min_client_fee)} (client side) / ${jmd(fc.min_provider_fee)} (provider side) per job, even if the percentage would work out lower.`);
     }
     return lines.join('\n');

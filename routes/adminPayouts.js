@@ -18,12 +18,11 @@ const express = require('express');
 const db = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
 const paymentCrypto = require('../lib/paymentCrypto');
+const { PAYABLE_STATUSES } = require('../lib/payoutStatuses');
 
 const router = express.Router();
 
 router.use(authenticate, authorize('admin'));
-
-const PAYABLE_STATUSES = ['completed', 'paid'];
 
 // ISO weeks run Monday–Sunday (matches date_trunc('week', ...) below) — every
 // weekStart this API accepts or returns must land on a Monday, or the
@@ -34,6 +33,16 @@ const PAYABLE_STATUSES = ['completed', 'paid'];
 // evening Jamaica time isn't bucketed into the wrong day/week, and so this
 // file's own endpoints and admin.js's fee-config/batch-log endpoint always
 // agree on where a week starts.
+//
+// Deploy-cutover note: this shifts every week boundary by Jamaica's UTC-5
+// offset versus the previous UTC-anchored version. A CSV downloaded under
+// the old boundaries and a mark-paid run after this deploys could in theory
+// disagree on which transactions belong to a given weekStart. Verified at
+// the time this shipped that there were no open (unpaid) weeks on the
+// shared dev/staging DB, so there was nothing to regroup. If this ever
+// redeploys onto a DB with an open unpaid week, download fresh CSVs (under
+// the new boundaries) before running mark-paid for that week rather than
+// reusing a pre-deploy file.
 const isMonday = (dateStr) => {
   const d = new Date(`${dateStr}T00:00:00Z`);
   return !Number.isNaN(d.getTime()) && d.getUTCDay() === 1;
@@ -271,6 +280,15 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         skipped++;
         continue;
       }
+      // Records mode isn't a bank submission, so it has no need for the
+      // full account number — only the bank-upload file (below) needs it
+      // verbatim. Masking everything but the last 4 digits here limits
+      // exposure if this file is ever shared/stored less carefully than
+      // the actual bank file.
+      if (includePaid && accountNumber) {
+        const digits = String(accountNumber);
+        accountNumber = digits.length <= 4 ? digits : '•'.repeat(digits.length - 4) + digits.slice(-4);
+      }
 
       const payeeName = r.account_ownership === 'business' && r.business_name
         ? r.business_name
@@ -317,6 +335,11 @@ router.get('/:weekStart/export-csv', async (req, res) => {
             AND tx.payout_batch_id IS NULL`,
         [weekStart, weekEnd.toISOString().slice(0, 10)]
       );
+    } else {
+      // Not a payout_batches write (this isn't a bank submission), but
+      // still bank account data leaving the system — log who pulled it
+      // and when, same as any other export of sensitive records.
+      console.log(`Records-mode payout CSV exported for week ${weekStart} by admin ${req.user.id} at ${new Date().toISOString()}`);
     }
 
     const header = [
@@ -327,6 +350,14 @@ router.get('/:weekStart/export-csv', async (req, res) => {
     const csvLines = [header, ...rows].map((row) =>
       row.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')
     );
+    if (includePaid) {
+      // A clearer marker than the filename suffix alone: Amount is 0 for
+      // fully-paid rows here and the Status column changes the layout, but
+      // it's still easy to mistake for the bank file at a glance. This
+      // banner is a harmless extra "column" to any real CSV parser/bank
+      // template, since it never reaches the bank-upload path.
+      csvLines.unshift('"FOR INTERNAL RECORDS ONLY — DO NOT UPLOAD TO BANK"');
+    }
     const csv = csvLines.join('\r\n');
 
     res.set('Content-Type', 'text/csv; charset=utf-8');
