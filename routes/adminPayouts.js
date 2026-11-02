@@ -28,7 +28,12 @@ const PAYABLE_STATUSES = ['completed', 'paid'];
 // ISO weeks run Monday–Sunday (matches date_trunc('week', ...) below) — every
 // weekStart this API accepts or returns must land on a Monday, or the
 // detail/mark-paid/export-csv 7-day window would silently drift from the
-// summary endpoint's week boundaries.
+// summary endpoint's week boundaries. Every date_trunc/range comparison on
+// completed_at in this file is pinned to 'America/Jamaica' (not left on the
+// DB session's own timezone, currently UTC) so a job completed in the
+// evening Jamaica time isn't bucketed into the wrong day/week, and so this
+// file's own endpoints and admin.js's fee-config/batch-log endpoint always
+// agree on where a week starts.
 const isMonday = (dateStr) => {
   const d = new Date(`${dateStr}T00:00:00Z`);
   return !Number.isNaN(d.getTime()) && d.getUTCDay() === 1;
@@ -50,10 +55,10 @@ router.get('/', async (req, res) => {
   try {
     const result = await db.query(`
       SELECT
-        to_char(date_trunc('week', tx.completed_at), 'YYYY-MM-DD') AS week_start,
-        to_char(date_trunc('week', tx.completed_at) + INTERVAL '6 days', 'YYYY-MM-DD') AS week_end,
-        EXTRACT(week FROM tx.completed_at)::int AS week_number,
-        EXTRACT(isoyear FROM tx.completed_at)::int AS week_year,
+        to_char(date_trunc('week', tx.completed_at AT TIME ZONE 'America/Jamaica'), 'YYYY-MM-DD') AS week_start,
+        to_char(date_trunc('week', tx.completed_at AT TIME ZONE 'America/Jamaica') + INTERVAL '6 days', 'YYYY-MM-DD') AS week_end,
+        EXTRACT(week FROM tx.completed_at AT TIME ZONE 'America/Jamaica')::int AS week_number,
+        EXTRACT(isoyear FROM tx.completed_at AT TIME ZONE 'America/Jamaica')::int AS week_year,
         COUNT(DISTINCT tx.provider_id)::int AS provider_count,
         COUNT(*)::int AS job_count,
         COALESCE(SUM(tx.amount), 0)::bigint AS gross_cents,
@@ -122,8 +127,8 @@ router.get('/:weekStart', async (req, res) => {
       FROM public.transactions tx
       JOIN public.users u ON u.id = tx.provider_id
       WHERE tx.status = ANY($1::transaction_status[])
-        AND tx.completed_at >= $2::date
-        AND tx.completed_at < ($2::date + INTERVAL '7 days')
+        AND tx.completed_at >= ($2::date AT TIME ZONE 'America/Jamaica')
+        AND tx.completed_at < (($2::date + INTERVAL '7 days') AT TIME ZONE 'America/Jamaica')
       GROUP BY tx.provider_id, u.first_name, u.last_name
       ORDER BY provider_name
     `, [PAYABLE_STATUSES, weekStart]);
@@ -176,8 +181,8 @@ router.patch('/mark-paid', async (req, res) => {
         `UPDATE public.transactions
             SET status = 'paid', paid_at = NOW()
           WHERE status = 'completed'
-            AND completed_at >= $1::date
-            AND completed_at < ($1::date + INTERVAL '7 days')
+            AND completed_at >= ($1::date AT TIME ZONE 'America/Jamaica')
+            AND completed_at < (($1::date + INTERVAL '7 days') AT TIME ZONE 'America/Jamaica')
             AND ($2::uuid[] IS NULL OR provider_id = ANY($2::uuid[]))
           RETURNING id`,
         [item.weekStart, providerIds]
@@ -193,35 +198,46 @@ router.patch('/mark-paid', async (req, res) => {
 
 // ============================================================
 // GET /api/admin/payouts/:weekStart/export-csv
-// Generates a Scotiabank-bound EFT batch CSV for a week's payable
-// transactions (completed or already paid — same PAYABLE_STATUSES as the
-// summary/detail endpoints above, so a week already marked paid can still
-// be re-exported for records instead of silently returning zero rows),
-// grouped by provider. See the field-mapping comment
-// below — this is a best-effort CSV wrapper over Jamaica's JCBA/ACH PPD
-// Entry Detail fields (documentation/PAYMENTS_AND_JOB_WORKFLOW.md §3), NOT
-// yet confirmed against Scotiabank's actual upload template. Providers
-// missing banking details are silently skipped (can't be paid by this
-// file); the count is returned in the X-Skipped-Providers header so the
-// frontend can warn before/after download.
+// Generates a Scotiabank-bound EFT batch CSV, grouped by provider. See the
+// field-mapping comment below — this is a best-effort CSV wrapper over
+// Jamaica's JCBA/ACH PPD Entry Detail fields
+// (documentation/PAYMENTS_AND_JOB_WORKFLOW.md §3), NOT yet confirmed
+// against Scotiabank's actual upload template; its 10-column layout is
+// kept exactly as before so adding a feature here can't be the thing that
+// gets a real file rejected by the bank. Providers missing banking details
+// are silently skipped (can't be paid by this file); the count is
+// returned in the X-Skipped-Providers header so the frontend can warn
+// before/after download.
 //
-// Because already-paid providers are included (so re-exporting a paid week
-// isn't just empty), every row carries a Status column (UNPAID / ALREADY
-// PAID / MIXED - PARTIALLY PAID) so re-uploading an already-processed batch
-// to the bank isn't silent — the admin sees it on the row before uploading.
-// The already-fully-paid provider count is also in the X-Already-Paid-Providers
-// header for the frontend to warn on before/after download.
+// Default (no query param) is a bank-upload file: UNPAID (status =
+// 'completed') transactions only, so an admin can never re-upload a batch
+// that was already paid and double-pay a provider. For the original
+// "CSV is empty" case — a week that's already fully paid — this file is
+// correctly empty; there's nothing left to pay.
+//
+// ?includePaid=1 switches to a records-only export (NOT meant for bank
+// upload) that also includes already-paid transactions so admins can
+// still get a non-empty CSV for a paid week's records. Its Amount column
+// still only ever sums the UNPAID portion (via FILTER), so even in this
+// mode the figure can never include money that's already been sent; an
+// extra Status column (UNPAID / ALREADY PAID / MIXED - PARTIALLY PAID)
+// says what the rest of that provider's row represents. This column only
+// appears in records mode, so the bank-bound file's layout never changes.
 // ============================================================
 router.get('/:weekStart/export-csv', async (req, res) => {
   const { weekStart } = req.params;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(weekStart) || !isMonday(weekStart)) {
     return res.status(400).json({ success: false, message: 'weekStart must be a YYYY-MM-DD Monday.' });
   }
+  const includePaid = req.query.includePaid === '1';
+  const statuses = includePaid ? PAYABLE_STATUSES : ['completed'];
   try {
     const result = await db.query(`
       SELECT
         tx.provider_id,
-        COALESCE(SUM(tx.provider_payout), 0)::bigint AS provider_payout_cents,
+        -- Only ever sums the still-payable (unpaid) portion, even in
+        -- records mode, so Amount can never include money already sent.
+        COALESCE(SUM(tx.provider_payout) FILTER (WHERE tx.status = 'completed'), 0)::bigint AS provider_payout_cents,
         bool_and(tx.status = 'paid') AS all_paid,
         bool_or(tx.status = 'paid') AS any_paid,
         pd.payee_first_name, pd.middle_initial, pd.payee_surname, pd.business_name, pd.account_ownership,
@@ -230,12 +246,12 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       FROM public.transactions tx
       LEFT JOIN public.provider_payment_details pd ON pd.provider_id = tx.provider_id
       WHERE tx.status = ANY($2::transaction_status[])
-        AND tx.completed_at >= $1::date
-        AND tx.completed_at < ($1::date + INTERVAL '7 days')
+        AND tx.completed_at >= ($1::date AT TIME ZONE 'America/Jamaica')
+        AND tx.completed_at < (($1::date + INTERVAL '7 days') AT TIME ZONE 'America/Jamaica')
       GROUP BY tx.provider_id, pd.payee_first_name, pd.middle_initial, pd.payee_surname,
                pd.business_name, pd.account_ownership, pd.recipient_id, pd.bank_name,
                pd.transit_code, pd.account_type, pd.account_number_encrypted
-    `, [weekStart, PAYABLE_STATUSES]);
+    `, [weekStart, statuses]);
 
     const weekEnd = new Date(weekStart);
     weekEnd.setDate(weekEnd.getDate() + 6);
@@ -260,14 +276,9 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         ? r.business_name
         : [r.payee_first_name, r.middle_initial, r.payee_surname].filter(Boolean).join(' ');
 
-      // Re-exporting a week already uploaded/processed risks the admin
-      // re-submitting the same file to the bank and double-paying a
-      // provider — so every row is explicitly marked rather than silently
-      // including already-paid providers alongside still-payable ones.
-      const status = r.all_paid ? 'ALREADY PAID' : r.any_paid ? 'MIXED - PARTIALLY PAID' : 'UNPAID';
       if (r.all_paid) alreadyPaidCount++;
 
-      rows.push([
+      const row = [
         payeeName,
         r.recipient_id || '',
         r.bank_name || '',
@@ -278,42 +289,48 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         'JMD',
         `TendrIt Payout WK${weekStart}`,
         weekStart,
-        status,
-      ]);
+      ];
+      if (includePaid) row.push(r.all_paid ? 'ALREADY PAID' : r.any_paid ? 'MIXED - PARTIALLY PAID' : 'UNPAID');
+      rows.push(row);
     }
 
     // Lazily create/update the payout_batches row so repeated downloads and
-    // the mark-paid flow share one identity for this week.
-    await db.query(
-      `INSERT INTO public.payout_batches (week_start, week_end, created_by, csv_downloaded_at)
-       VALUES ($1, $2, $3, NOW())
-       ON CONFLICT (week_start, week_end) DO UPDATE SET csv_downloaded_at = NOW()`,
-      [weekStart, weekEnd.toISOString().slice(0, 10), req.user.id]
-    );
-    // Link this week's payable transactions to the batch for traceability
-    // (does not change their status — only mark-paid does that).
-    await db.query(
-      `UPDATE public.transactions tx
-          SET payout_batch_id = pb.id
-         FROM public.payout_batches pb
-        WHERE pb.week_start = $1 AND pb.week_end = $2
-          AND tx.status IN ('completed', 'paid')
-          AND tx.completed_at >= $1::date AND tx.completed_at < ($1::date + INTERVAL '7 days')
-          AND tx.payout_batch_id IS NULL`,
-      [weekStart, weekEnd.toISOString().slice(0, 10)]
-    );
+    // the mark-paid flow share one identity for this week. Records-mode
+    // exports don't touch this — they're not a bank submission.
+    if (!includePaid) {
+      await db.query(
+        `INSERT INTO public.payout_batches (week_start, week_end, created_by, csv_downloaded_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (week_start, week_end) DO UPDATE SET csv_downloaded_at = NOW()`,
+        [weekStart, weekEnd.toISOString().slice(0, 10), req.user.id]
+      );
+      // Link this week's payable transactions to the batch for traceability
+      // (does not change their status — only mark-paid does that).
+      await db.query(
+        `UPDATE public.transactions tx
+            SET payout_batch_id = pb.id
+           FROM public.payout_batches pb
+          WHERE pb.week_start = $1 AND pb.week_end = $2
+            AND tx.status IN ('completed', 'paid')
+            AND tx.completed_at >= ($1::date AT TIME ZONE 'America/Jamaica')
+            AND tx.completed_at < (($1::date + INTERVAL '7 days') AT TIME ZONE 'America/Jamaica')
+            AND tx.payout_batch_id IS NULL`,
+        [weekStart, weekEnd.toISOString().slice(0, 10)]
+      );
+    }
 
     const header = [
       'Payee Name', 'Individual ID (TRN)', 'Bank Name', 'Transit Code',
-      'Account Type', 'Account Number', 'Amount', 'Currency', 'Reference', 'Payment Date', 'Status',
+      'Account Type', 'Account Number', 'Amount', 'Currency', 'Reference', 'Payment Date',
     ];
+    if (includePaid) header.push('Status');
     const csvLines = [header, ...rows].map((row) =>
       row.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')
     );
     const csv = csvLines.join('\r\n');
 
     res.set('Content-Type', 'text/csv; charset=utf-8');
-    res.set('Content-Disposition', `attachment; filename="tendrit-payout-${weekStart}.csv"`);
+    res.set('Content-Disposition', `attachment; filename="tendrit-payout-${weekStart}${includePaid ? '-records' : ''}.csv"`);
     res.set('X-Skipped-Providers', String(skipped));
     res.set('X-Already-Paid-Providers', String(alreadyPaidCount));
     res.send(csv);

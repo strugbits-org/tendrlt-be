@@ -47,7 +47,9 @@ async function loadFeeFacts() {
          FROM public.platform_fee_config WHERE id = 1`
     );
     const fc = rows[0];
-    if (!fc) return null;
+    // Number(null) is 0, not NaN — without this check a null rate would make
+    // the bot confidently state a 0% fee instead of omitting the fact.
+    if (!fc || fc.client_rate == null || fc.provider_rate == null) return null;
     const jmd = (cents) => `J$${Math.round(Number(cents) / 100).toLocaleString()}`;
     const lines = [
       `Homeowner/client platform fee: ${Number(fc.client_rate)}% of the job value.`,

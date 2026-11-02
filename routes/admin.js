@@ -1272,10 +1272,10 @@ router.get('/fee-config/batch-log', async (req, res) => {
   try {
     const result = await db.query(`
       SELECT
-        to_char(date_trunc('week', tx.completed_at), 'YYYY-MM-DD') AS week_start,
-        to_char(date_trunc('week', tx.completed_at) + INTERVAL '6 days', 'YYYY-MM-DD') AS week_end,
-        EXTRACT(week FROM tx.completed_at)::int AS week_number,
-        EXTRACT(isoyear FROM tx.completed_at)::int AS week_year,
+        to_char(date_trunc('week', tx.completed_at AT TIME ZONE 'America/Jamaica'), 'YYYY-MM-DD') AS week_start,
+        to_char(date_trunc('week', tx.completed_at AT TIME ZONE 'America/Jamaica') + INTERVAL '6 days', 'YYYY-MM-DD') AS week_end,
+        EXTRACT(week FROM tx.completed_at AT TIME ZONE 'America/Jamaica')::int AS week_number,
+        EXTRACT(isoyear FROM tx.completed_at AT TIME ZONE 'America/Jamaica')::int AS week_year,
         COUNT(*)::int AS txns,
         COALESCE(SUM(tx.amount), 0)::bigint AS gross_cents,
         COALESCE(SUM(tx.client_fee), 0)::bigint AS client_fee_cents,
