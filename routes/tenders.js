@@ -45,8 +45,14 @@ const PATCHABLE = [
 // a valid budget value.
 const MAX_BUDGET_CENTS = 2147483647;
 function parseBudgetField(raw, label) {
-  if (!raw) return { cents: null };
-  const n = parseFloat(raw);
+  // undefined/null/'' means "no budget given" -> null. Anything else,
+  // including an explicit "0", is a real value to parse and validate below.
+  if (raw === undefined || raw === null || raw === '') return { cents: null };
+  // Number(), not parseFloat(): parseFloat accepts a numeric PREFIX and
+  // silently ignores the rest ("12abc" -> 12), which would let exactly the
+  // kind of malformed input this validation exists to catch slip through.
+  // Number() requires the whole string to be numeric, returning NaN otherwise.
+  const n = Number(raw);
   if (!Number.isFinite(n)) return { error: `${label} must be a valid number.` };
   const cents = Math.round(n * 100);
   if (cents < 0) return { error: `${label} cannot be negative.` };
