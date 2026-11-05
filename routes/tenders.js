@@ -37,6 +37,39 @@ const PATCHABLE = [
   'location_lat', 'location_lng',
 ];
 
+// budget_min/budget_max are INTEGER columns (dollars-as-cents) — Postgres's
+// INTEGER range is -2,147,483,648..2,147,483,647, so anything parsing to a
+// larger magnitude would otherwise reach the DB and surface as a raw 500
+// ("integer out of range") instead of the clean 400 this is meant to give.
+// Shared by POST / and PATCH /:id so the two can't drift on what counts as
+// a valid budget value.
+const MAX_BUDGET_CENTS = 2147483647;
+function parseBudgetField(raw, label) {
+  // Multer form fields are always strings for a single value — a non-string
+  // here (an array from a duplicated field name, a boolean, etc.) is never
+  // a legitimate budget, so it's treated the same as "nothing given" rather
+  // than coerced by Number().
+  if (typeof raw !== 'string') return { cents: null };
+  const trimmed = raw.trim();
+  if (trimmed === '') return { cents: null };
+  // A strict decimal-number regex instead of Number()/parseFloat(): both of
+  // those coerce inputs no one actually wants treated as a budget —
+  // parseFloat('12abc') -> 12 (ignores the trailing garbage), Number('0x10')
+  // -> 16 (hex), Number(' ') -> 0 (whitespace). This only accepts an
+  // optional leading '-' and plain digits, optionally with a decimal point.
+  if (!/^-?\d+(\.\d+)?$/.test(trimmed)) return { error: `${label} must be a valid number.` };
+  const cents = Math.round(Number(trimmed) * 100);
+  if (cents < 0) return { error: `${label} cannot be negative.` };
+  if (cents > MAX_BUDGET_CENTS) return { error: `${label} is too large.` };
+  // A $0 budget isn't a meaningful value and the frontend's formatBudget()
+  // already renders it identically to "not specified" (both show "—") — so
+  // storing 0 rather than null here would be a distinction with no visible
+  // difference. Collapsing it to null matches that existing display and the
+  // original pre-validation behavior (a truthy check treated "0" as falsy).
+  if (cents === 0) return { cents: null };
+  return { cents };
+}
+
 // ============================================================
 // notifyMatchedProviders
 // Called (fire-and-forget) when a tender transitions to 'open'.
@@ -183,8 +216,18 @@ router.post('/',
     }
 
     const cleanPhone = contact_phone ? contact_phone.replace(/\D/g, '') : null;
-    const budgetMinCents = budget_min ? Math.round(parseFloat(budget_min) * 100) : null;
-    const budgetMaxCents = budget_max ? Math.round(parseFloat(budget_max) * 100) : null;
+    const minParsed = parseBudgetField(budget_min, 'Min budget');
+    if (minParsed.error) return res.status(400).json({ success: false, message: minParsed.error });
+    const maxParsed = parseBudgetField(budget_max, 'Max budget');
+    if (maxParsed.error) return res.status(400).json({ success: false, message: maxParsed.error });
+    const budgetMinCents = minParsed.cents;
+    const budgetMaxCents = maxParsed.cents;
+    // The frontend already enforces this, but the API has to stand on its own —
+    // without this, an inverted range (e.g. min $99,999 / max $10) is stored
+    // and shown as-is on a published, publicly-browsable tender.
+    if (budgetMinCents !== null && budgetMaxCents !== null && budgetMinCents > budgetMaxCents) {
+      return res.status(400).json({ success: false, message: 'Max budget must be greater than or equal to min budget.' });
+    }
     const lat = location_lat ? parseFloat(location_lat) : null;
     const lng = location_lng ? parseFloat(location_lng) : null;
 
@@ -315,15 +358,17 @@ router.patch('/:id',
     // An already-published (open) tender can only be edited while it has NO
     // quotes. Once a provider has quoted, the brief is locked. Drafts and the
     // draft→open publish step are unaffected (a draft has no quotes yet).
-    let currentStatus;
+    let currentStatus, currentBudgetMin, currentBudgetMax;
     try {
       const guard = await db.queryAsUserBatch(req.user.id, [
-        { text: `SELECT status, trashed_at FROM public.tenders WHERE id = $1 AND client_id = $2`, params: [id, req.user.id] },
+        { text: `SELECT status, trashed_at, budget_min, budget_max FROM public.tenders WHERE id = $1 AND client_id = $2`, params: [id, req.user.id] },
         { text: `SELECT COUNT(*)::int AS n FROM public.quotes WHERE tender_id = $1`, params: [id] },
       ]);
       if (guard[0].rows.length === 0) {
         return res.status(404).json({ success: false, message: 'Tender not found.' });
       }
+      currentBudgetMin = guard[0].rows[0].budget_min;
+      currentBudgetMax = guard[0].rows[0].budget_max;
       // A tender removed by an admin is read-only for the homeowner.
       if (guard[0].rows[0].trashed_at) {
         return res.status(409).json({
@@ -417,11 +462,43 @@ router.patch('/:id',
       paramIdx++;
     }
 
-    if (req.body.budget_min !== undefined) {
-      addField('budget_min', req.body.budget_min ? Math.round(parseFloat(req.body.budget_min) * 100) : null);
-    }
-    if (req.body.budget_max !== undefined) {
-      addField('budget_max', req.body.budget_max ? Math.round(parseFloat(req.body.budget_max) * 100) : null);
+    // Validate/touch budget when either field is actually part of this
+    // request — otherwise an unrelated edit (just the title, say) on a
+    // tender whose stored range predates this validation would be
+    // permanently stuck rejecting every PATCH — OR when this request is
+    // publishing the tender (status -> 'open'), since a draft with a bad
+    // legacy range (created before this validation existed) would otherwise
+    // reach the public, browsable listing untouched the moment it publishes,
+    // without ever touching the budget fields in that same request.
+    const willPublish = status === 'open';
+    if (req.body.budget_min !== undefined || req.body.budget_max !== undefined || willPublish) {
+      let newBudgetMin, newBudgetMax;
+      if (req.body.budget_min !== undefined) {
+        const p = parseBudgetField(req.body.budget_min, 'Min budget');
+        if (p.error) return res.status(400).json({ success: false, message: p.error });
+        newBudgetMin = p.cents;
+      }
+      if (req.body.budget_max !== undefined) {
+        const p = parseBudgetField(req.body.budget_max, 'Max budget');
+        if (p.error) return res.status(400).json({ success: false, message: p.error });
+        newBudgetMax = p.cents;
+      }
+      // Validate against the EFFECTIVE pair (whichever side wasn't in this
+      // request keeps its current stored value) — editing just one side, or
+      // publishing without touching either side, shouldn't be able to leave
+      // an inverted/negative range in place. currentBudgetMin/currentBudgetMax
+      // are read straight from the row (INTEGER columns, confirmed to come
+      // back as native numbers, not strings).
+      const effectiveMin = newBudgetMin !== undefined ? newBudgetMin : currentBudgetMin;
+      const effectiveMax = newBudgetMax !== undefined ? newBudgetMax : currentBudgetMax;
+      if ((effectiveMin !== null && effectiveMin < 0) || (effectiveMax !== null && effectiveMax < 0)) {
+        return res.status(400).json({ success: false, message: 'Budget cannot be negative.' });
+      }
+      if (effectiveMin !== null && effectiveMax !== null && effectiveMin > effectiveMax) {
+        return res.status(400).json({ success: false, message: 'Max budget must be greater than or equal to min budget.' });
+      }
+      if (newBudgetMin !== undefined) addField('budget_min', newBudgetMin);
+      if (newBudgetMax !== undefined) addField('budget_max', newBudgetMax);
     }
 
     if (status !== undefined) {

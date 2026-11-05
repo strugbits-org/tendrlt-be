@@ -109,7 +109,7 @@ router.post('/', authenticate, authorize('provider'), requireIdentityVerified, a
     // reading the provider's own user row, so a JOIN to the homeowner's row returns
     // 0 rows and makes the whole query look like "Tender not found".
     const tenderCheck = await db.queryAsUser(req.user.id, `
-      SELECT t.id, t.client_id, t.status,
+      SELECT t.id, t.client_id, t.status, t.expires_at,
              st.display_name AS service_name
       FROM public.tenders t
       LEFT JOIN public.service_types st ON st.id = t.service_type_id
@@ -133,6 +133,16 @@ router.post('/', authenticate, authorize('provider'), requireIdentityVerified, a
 
     if (tender.status !== 'open') {
       return res.status(409).json({ success: false, message: 'This tender is no longer accepting quotes.' });
+    }
+    // expires_at only gates DISCOVERABILITY on the public browse/detail
+    // endpoints — status alone never flips when a tender's expiry passes
+    // (there's no 'expired' tender_status, see the enum). Without this
+    // check a provider who already had the tender open (or guessed/reused
+    // a link) could still quote on it indefinitely after it vanished from
+    // every listing, with the homeowner's My Tenders still showing it as a
+    // plain "active" tender with no hint it had expired.
+    if (tender.expires_at && new Date(tender.expires_at) <= new Date()) {
+      return res.status(409).json({ success: false, message: 'This tender has expired and is no longer accepting quotes.' });
     }
 
     if (tender.client_id === req.user.id) {
