@@ -45,18 +45,28 @@ const PATCHABLE = [
 // a valid budget value.
 const MAX_BUDGET_CENTS = 2147483647;
 function parseBudgetField(raw, label) {
-  // undefined/null/'' means "no budget given" -> null. Anything else,
-  // including an explicit "0", is a real value to parse and validate below.
-  if (raw === undefined || raw === null || raw === '') return { cents: null };
-  // Number(), not parseFloat(): parseFloat accepts a numeric PREFIX and
-  // silently ignores the rest ("12abc" -> 12), which would let exactly the
-  // kind of malformed input this validation exists to catch slip through.
-  // Number() requires the whole string to be numeric, returning NaN otherwise.
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return { error: `${label} must be a valid number.` };
-  const cents = Math.round(n * 100);
+  // Multer form fields are always strings for a single value — a non-string
+  // here (an array from a duplicated field name, a boolean, etc.) is never
+  // a legitimate budget, so it's treated the same as "nothing given" rather
+  // than coerced by Number().
+  if (typeof raw !== 'string') return { cents: null };
+  const trimmed = raw.trim();
+  if (trimmed === '') return { cents: null };
+  // A strict decimal-number regex instead of Number()/parseFloat(): both of
+  // those coerce inputs no one actually wants treated as a budget —
+  // parseFloat('12abc') -> 12 (ignores the trailing garbage), Number('0x10')
+  // -> 16 (hex), Number(' ') -> 0 (whitespace). This only accepts an
+  // optional leading '-' and plain digits, optionally with a decimal point.
+  if (!/^-?\d+(\.\d+)?$/.test(trimmed)) return { error: `${label} must be a valid number.` };
+  const cents = Math.round(Number(trimmed) * 100);
   if (cents < 0) return { error: `${label} cannot be negative.` };
   if (cents > MAX_BUDGET_CENTS) return { error: `${label} is too large.` };
+  // A $0 budget isn't a meaningful value and the frontend's formatBudget()
+  // already renders it identically to "not specified" (both show "—") — so
+  // storing 0 rather than null here would be a distinction with no visible
+  // difference. Collapsing it to null matches that existing display and the
+  // original pre-validation behavior (a truthy check treated "0" as falsy).
+  if (cents === 0) return { cents: null };
   return { cents };
 }
 
@@ -452,11 +462,16 @@ router.patch('/:id',
       paramIdx++;
     }
 
-    // Only validate/touch budget at all when one of the two fields is
-    // actually part of this request — otherwise an unrelated edit (title,
-    // publishing a draft, etc.) on a tender whose stored range predates
-    // this validation would be permanently stuck rejecting every PATCH.
-    if (req.body.budget_min !== undefined || req.body.budget_max !== undefined) {
+    // Validate/touch budget when either field is actually part of this
+    // request — otherwise an unrelated edit (just the title, say) on a
+    // tender whose stored range predates this validation would be
+    // permanently stuck rejecting every PATCH — OR when this request is
+    // publishing the tender (status -> 'open'), since a draft with a bad
+    // legacy range (created before this validation existed) would otherwise
+    // reach the public, browsable listing untouched the moment it publishes,
+    // without ever touching the budget fields in that same request.
+    const willPublish = status === 'open';
+    if (req.body.budget_min !== undefined || req.body.budget_max !== undefined || willPublish) {
       let newBudgetMin, newBudgetMax;
       if (req.body.budget_min !== undefined) {
         const p = parseBudgetField(req.body.budget_min, 'Min budget');
@@ -469,13 +484,16 @@ router.patch('/:id',
         newBudgetMax = p.cents;
       }
       // Validate against the EFFECTIVE pair (whichever side wasn't in this
-      // request keeps its current stored value) — editing just one side
-      // shouldn't be able to produce an inverted range either. currentBudgetMin/
-      // currentBudgetMax are already-valid stored values (INTEGER columns,
-      // confirmed to come back as native numbers, not strings), so they don't
-      // need re-validating here — only newly-parsed input does, above.
+      // request keeps its current stored value) — editing just one side, or
+      // publishing without touching either side, shouldn't be able to leave
+      // an inverted/negative range in place. currentBudgetMin/currentBudgetMax
+      // are read straight from the row (INTEGER columns, confirmed to come
+      // back as native numbers, not strings).
       const effectiveMin = newBudgetMin !== undefined ? newBudgetMin : currentBudgetMin;
       const effectiveMax = newBudgetMax !== undefined ? newBudgetMax : currentBudgetMax;
+      if ((effectiveMin !== null && effectiveMin < 0) || (effectiveMax !== null && effectiveMax < 0)) {
+        return res.status(400).json({ success: false, message: 'Budget cannot be negative.' });
+      }
       if (effectiveMin !== null && effectiveMax !== null && effectiveMin > effectiveMax) {
         return res.status(400).json({ success: false, message: 'Max budget must be greater than or equal to min budget.' });
       }
