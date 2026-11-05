@@ -185,6 +185,15 @@ router.post('/',
     const cleanPhone = contact_phone ? contact_phone.replace(/\D/g, '') : null;
     const budgetMinCents = budget_min ? Math.round(parseFloat(budget_min) * 100) : null;
     const budgetMaxCents = budget_max ? Math.round(parseFloat(budget_max) * 100) : null;
+    // The frontend already enforces this, but the API has to stand on its own —
+    // without this, an inverted or negative range (e.g. min $99,999 / max $10)
+    // is stored and shown as-is on a published, publicly-browsable tender.
+    if ((budgetMinCents !== null && budgetMinCents < 0) || (budgetMaxCents !== null && budgetMaxCents < 0)) {
+      return res.status(400).json({ success: false, message: 'Budget cannot be negative.' });
+    }
+    if (budgetMinCents !== null && budgetMaxCents !== null && budgetMinCents > budgetMaxCents) {
+      return res.status(400).json({ success: false, message: 'Max budget must be greater than or equal to min budget.' });
+    }
     const lat = location_lat ? parseFloat(location_lat) : null;
     const lng = location_lng ? parseFloat(location_lng) : null;
 
@@ -315,15 +324,17 @@ router.patch('/:id',
     // An already-published (open) tender can only be edited while it has NO
     // quotes. Once a provider has quoted, the brief is locked. Drafts and the
     // draft→open publish step are unaffected (a draft has no quotes yet).
-    let currentStatus;
+    let currentStatus, currentBudgetMin, currentBudgetMax;
     try {
       const guard = await db.queryAsUserBatch(req.user.id, [
-        { text: `SELECT status, trashed_at FROM public.tenders WHERE id = $1 AND client_id = $2`, params: [id, req.user.id] },
+        { text: `SELECT status, trashed_at, budget_min, budget_max FROM public.tenders WHERE id = $1 AND client_id = $2`, params: [id, req.user.id] },
         { text: `SELECT COUNT(*)::int AS n FROM public.quotes WHERE tender_id = $1`, params: [id] },
       ]);
       if (guard[0].rows.length === 0) {
         return res.status(404).json({ success: false, message: 'Tender not found.' });
       }
+      currentBudgetMin = guard[0].rows[0].budget_min;
+      currentBudgetMax = guard[0].rows[0].budget_max;
       // A tender removed by an admin is read-only for the homeowner.
       if (guard[0].rows[0].trashed_at) {
         return res.status(409).json({
@@ -417,12 +428,25 @@ router.patch('/:id',
       paramIdx++;
     }
 
-    if (req.body.budget_min !== undefined) {
-      addField('budget_min', req.body.budget_min ? Math.round(parseFloat(req.body.budget_min) * 100) : null);
+    const newBudgetMin = req.body.budget_min !== undefined
+      ? (req.body.budget_min ? Math.round(parseFloat(req.body.budget_min) * 100) : null)
+      : undefined;
+    const newBudgetMax = req.body.budget_max !== undefined
+      ? (req.body.budget_max ? Math.round(parseFloat(req.body.budget_max) * 100) : null)
+      : undefined;
+    // Validate against the EFFECTIVE pair (whichever side wasn't in this
+    // request keeps its current stored value) — editing just one side
+    // shouldn't be able to produce an inverted/negative range either.
+    const effectiveMin = newBudgetMin !== undefined ? newBudgetMin : currentBudgetMin;
+    const effectiveMax = newBudgetMax !== undefined ? newBudgetMax : currentBudgetMax;
+    if ((effectiveMin !== null && effectiveMin < 0) || (effectiveMax !== null && effectiveMax < 0)) {
+      return res.status(400).json({ success: false, message: 'Budget cannot be negative.' });
     }
-    if (req.body.budget_max !== undefined) {
-      addField('budget_max', req.body.budget_max ? Math.round(parseFloat(req.body.budget_max) * 100) : null);
+    if (effectiveMin !== null && effectiveMax !== null && effectiveMin > effectiveMax) {
+      return res.status(400).json({ success: false, message: 'Max budget must be greater than or equal to min budget.' });
     }
+    if (newBudgetMin !== undefined) addField('budget_min', newBudgetMin);
+    if (newBudgetMax !== undefined) addField('budget_max', newBudgetMax);
 
     if (status !== undefined) {
       setClauses.push(`status = $${paramIdx}::tender_status`);

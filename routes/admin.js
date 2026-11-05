@@ -1964,7 +1964,7 @@ router.get('/providers', async (req, res) => {
     const distP = db.query(`SELECT rating AS stars, COUNT(*)::int AS count FROM public.reviews GROUP BY rating`);
 
     const clientsP = db.query(`
-      SELECT u.display_code, (u.first_name || ' ' || u.last_name) AS name,
+      SELECT u.id AS client_id, u.display_code, (u.first_name || ' ' || u.last_name) AS name,
              SUM(tx.amount + tx.client_fee)::bigint AS spend_cents,
              COUNT(*)::int AS jobs
       FROM public.transactions tx
@@ -1998,6 +1998,7 @@ router.get('/providers', async (req, res) => {
         active: r.active === true,
       })),
       clients: clients.rows.map((c) => ({
+        clientId: c.client_id,
         name: c.name,
         displayCode: c.display_code,
         spendCents: Number(c.spend_cents),
