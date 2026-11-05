@@ -183,6 +183,18 @@ router.post('/',
     }
 
     const cleanPhone = contact_phone ? contact_phone.replace(/\D/g, '') : null;
+    // parseFloat('abc') / parseFloat('Infinity') aren't caught by a plain
+    // `< 0` or `> other` comparison (NaN compares false against everything,
+    // and Infinity is a value a comparison alone won't reject) — both would
+    // otherwise reach the INTEGER column and surface as an ugly 500 instead
+    // of a clean 400. Number.isFinite rejects NaN, ±Infinity, and anything
+    // that isn't a true number in one check.
+    if (budget_min && !Number.isFinite(parseFloat(budget_min))) {
+      return res.status(400).json({ success: false, message: 'Min budget must be a valid number.' });
+    }
+    if (budget_max && !Number.isFinite(parseFloat(budget_max))) {
+      return res.status(400).json({ success: false, message: 'Max budget must be a valid number.' });
+    }
     const budgetMinCents = budget_min ? Math.round(parseFloat(budget_min) * 100) : null;
     const budgetMaxCents = budget_max ? Math.round(parseFloat(budget_max) * 100) : null;
     // The frontend already enforces this, but the API has to stand on its own —
@@ -428,25 +440,37 @@ router.patch('/:id',
       paramIdx++;
     }
 
-    const newBudgetMin = req.body.budget_min !== undefined
-      ? (req.body.budget_min ? Math.round(parseFloat(req.body.budget_min) * 100) : null)
-      : undefined;
-    const newBudgetMax = req.body.budget_max !== undefined
-      ? (req.body.budget_max ? Math.round(parseFloat(req.body.budget_max) * 100) : null)
-      : undefined;
-    // Validate against the EFFECTIVE pair (whichever side wasn't in this
-    // request keeps its current stored value) — editing just one side
-    // shouldn't be able to produce an inverted/negative range either.
-    const effectiveMin = newBudgetMin !== undefined ? newBudgetMin : currentBudgetMin;
-    const effectiveMax = newBudgetMax !== undefined ? newBudgetMax : currentBudgetMax;
-    if ((effectiveMin !== null && effectiveMin < 0) || (effectiveMax !== null && effectiveMax < 0)) {
-      return res.status(400).json({ success: false, message: 'Budget cannot be negative.' });
+    // Only validate/touch budget at all when one of the two fields is
+    // actually part of this request — otherwise an unrelated edit (title,
+    // publishing a draft, etc.) on a tender whose stored range predates
+    // this validation would be permanently stuck rejecting every PATCH.
+    if (req.body.budget_min !== undefined || req.body.budget_max !== undefined) {
+      if (req.body.budget_min && !Number.isFinite(parseFloat(req.body.budget_min))) {
+        return res.status(400).json({ success: false, message: 'Min budget must be a valid number.' });
+      }
+      if (req.body.budget_max && !Number.isFinite(parseFloat(req.body.budget_max))) {
+        return res.status(400).json({ success: false, message: 'Max budget must be a valid number.' });
+      }
+      const newBudgetMin = req.body.budget_min !== undefined
+        ? (req.body.budget_min ? Math.round(parseFloat(req.body.budget_min) * 100) : null)
+        : undefined;
+      const newBudgetMax = req.body.budget_max !== undefined
+        ? (req.body.budget_max ? Math.round(parseFloat(req.body.budget_max) * 100) : null)
+        : undefined;
+      // Validate against the EFFECTIVE pair (whichever side wasn't in this
+      // request keeps its current stored value) — editing just one side
+      // shouldn't be able to produce an inverted/negative range either.
+      const effectiveMin = newBudgetMin !== undefined ? newBudgetMin : currentBudgetMin;
+      const effectiveMax = newBudgetMax !== undefined ? newBudgetMax : currentBudgetMax;
+      if ((effectiveMin !== null && effectiveMin < 0) || (effectiveMax !== null && effectiveMax < 0)) {
+        return res.status(400).json({ success: false, message: 'Budget cannot be negative.' });
+      }
+      if (effectiveMin !== null && effectiveMax !== null && effectiveMin > effectiveMax) {
+        return res.status(400).json({ success: false, message: 'Max budget must be greater than or equal to min budget.' });
+      }
+      if (newBudgetMin !== undefined) addField('budget_min', newBudgetMin);
+      if (newBudgetMax !== undefined) addField('budget_max', newBudgetMax);
     }
-    if (effectiveMin !== null && effectiveMax !== null && effectiveMin > effectiveMax) {
-      return res.status(400).json({ success: false, message: 'Max budget must be greater than or equal to min budget.' });
-    }
-    if (newBudgetMin !== undefined) addField('budget_min', newBudgetMin);
-    if (newBudgetMax !== undefined) addField('budget_max', newBudgetMax);
 
     if (status !== undefined) {
       setClauses.push(`status = $${paramIdx}::tender_status`);
