@@ -37,6 +37,23 @@ const PATCHABLE = [
   'location_lat', 'location_lng',
 ];
 
+// budget_min/budget_max are INTEGER columns (dollars-as-cents) — Postgres's
+// INTEGER range is -2,147,483,648..2,147,483,647, so anything parsing to a
+// larger magnitude would otherwise reach the DB and surface as a raw 500
+// ("integer out of range") instead of the clean 400 this is meant to give.
+// Shared by POST / and PATCH /:id so the two can't drift on what counts as
+// a valid budget value.
+const MAX_BUDGET_CENTS = 2147483647;
+function parseBudgetField(raw, label) {
+  if (!raw) return { cents: null };
+  const n = parseFloat(raw);
+  if (!Number.isFinite(n)) return { error: `${label} must be a valid number.` };
+  const cents = Math.round(n * 100);
+  if (cents < 0) return { error: `${label} cannot be negative.` };
+  if (cents > MAX_BUDGET_CENTS) return { error: `${label} is too large.` };
+  return { cents };
+}
+
 // ============================================================
 // notifyMatchedProviders
 // Called (fire-and-forget) when a tender transitions to 'open'.
@@ -183,26 +200,15 @@ router.post('/',
     }
 
     const cleanPhone = contact_phone ? contact_phone.replace(/\D/g, '') : null;
-    // parseFloat('abc') / parseFloat('Infinity') aren't caught by a plain
-    // `< 0` or `> other` comparison (NaN compares false against everything,
-    // and Infinity is a value a comparison alone won't reject) — both would
-    // otherwise reach the INTEGER column and surface as an ugly 500 instead
-    // of a clean 400. Number.isFinite rejects NaN, ±Infinity, and anything
-    // that isn't a true number in one check.
-    if (budget_min && !Number.isFinite(parseFloat(budget_min))) {
-      return res.status(400).json({ success: false, message: 'Min budget must be a valid number.' });
-    }
-    if (budget_max && !Number.isFinite(parseFloat(budget_max))) {
-      return res.status(400).json({ success: false, message: 'Max budget must be a valid number.' });
-    }
-    const budgetMinCents = budget_min ? Math.round(parseFloat(budget_min) * 100) : null;
-    const budgetMaxCents = budget_max ? Math.round(parseFloat(budget_max) * 100) : null;
+    const minParsed = parseBudgetField(budget_min, 'Min budget');
+    if (minParsed.error) return res.status(400).json({ success: false, message: minParsed.error });
+    const maxParsed = parseBudgetField(budget_max, 'Max budget');
+    if (maxParsed.error) return res.status(400).json({ success: false, message: maxParsed.error });
+    const budgetMinCents = minParsed.cents;
+    const budgetMaxCents = maxParsed.cents;
     // The frontend already enforces this, but the API has to stand on its own —
-    // without this, an inverted or negative range (e.g. min $99,999 / max $10)
-    // is stored and shown as-is on a published, publicly-browsable tender.
-    if ((budgetMinCents !== null && budgetMinCents < 0) || (budgetMaxCents !== null && budgetMaxCents < 0)) {
-      return res.status(400).json({ success: false, message: 'Budget cannot be negative.' });
-    }
+    // without this, an inverted range (e.g. min $99,999 / max $10) is stored
+    // and shown as-is on a published, publicly-browsable tender.
     if (budgetMinCents !== null && budgetMaxCents !== null && budgetMinCents > budgetMaxCents) {
       return res.status(400).json({ success: false, message: 'Max budget must be greater than or equal to min budget.' });
     }
@@ -445,26 +451,25 @@ router.patch('/:id',
     // publishing a draft, etc.) on a tender whose stored range predates
     // this validation would be permanently stuck rejecting every PATCH.
     if (req.body.budget_min !== undefined || req.body.budget_max !== undefined) {
-      if (req.body.budget_min && !Number.isFinite(parseFloat(req.body.budget_min))) {
-        return res.status(400).json({ success: false, message: 'Min budget must be a valid number.' });
+      let newBudgetMin, newBudgetMax;
+      if (req.body.budget_min !== undefined) {
+        const p = parseBudgetField(req.body.budget_min, 'Min budget');
+        if (p.error) return res.status(400).json({ success: false, message: p.error });
+        newBudgetMin = p.cents;
       }
-      if (req.body.budget_max && !Number.isFinite(parseFloat(req.body.budget_max))) {
-        return res.status(400).json({ success: false, message: 'Max budget must be a valid number.' });
+      if (req.body.budget_max !== undefined) {
+        const p = parseBudgetField(req.body.budget_max, 'Max budget');
+        if (p.error) return res.status(400).json({ success: false, message: p.error });
+        newBudgetMax = p.cents;
       }
-      const newBudgetMin = req.body.budget_min !== undefined
-        ? (req.body.budget_min ? Math.round(parseFloat(req.body.budget_min) * 100) : null)
-        : undefined;
-      const newBudgetMax = req.body.budget_max !== undefined
-        ? (req.body.budget_max ? Math.round(parseFloat(req.body.budget_max) * 100) : null)
-        : undefined;
       // Validate against the EFFECTIVE pair (whichever side wasn't in this
       // request keeps its current stored value) — editing just one side
-      // shouldn't be able to produce an inverted/negative range either.
+      // shouldn't be able to produce an inverted range either. currentBudgetMin/
+      // currentBudgetMax are already-valid stored values (INTEGER columns,
+      // confirmed to come back as native numbers, not strings), so they don't
+      // need re-validating here — only newly-parsed input does, above.
       const effectiveMin = newBudgetMin !== undefined ? newBudgetMin : currentBudgetMin;
       const effectiveMax = newBudgetMax !== undefined ? newBudgetMax : currentBudgetMax;
-      if ((effectiveMin !== null && effectiveMin < 0) || (effectiveMax !== null && effectiveMax < 0)) {
-        return res.status(400).json({ success: false, message: 'Budget cannot be negative.' });
-      }
       if (effectiveMin !== null && effectiveMax !== null && effectiveMin > effectiveMax) {
         return res.status(400).json({ success: false, message: 'Max budget must be greater than or equal to min budget.' });
       }
