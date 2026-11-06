@@ -207,47 +207,45 @@ router.patch('/mark-paid', async (req, res) => {
 
 // ============================================================
 // GET /api/admin/payouts/:weekStart/export-csv
-// Generates a Scotiabank-bound EFT batch CSV, grouped by provider. See the
-// field-mapping comment below — this is a best-effort CSV wrapper over
-// Jamaica's JCBA/ACH PPD Entry Detail fields
-// (documentation/PAYMENTS_AND_JOB_WORKFLOW.md §3), NOT yet confirmed
-// against Scotiabank's actual upload template; its 10-column layout is
-// kept exactly as before so adding a feature here can't be the thing that
-// gets a real file rejected by the bank. Providers missing banking details
-// are silently skipped (can't be paid by this file); the count is
-// returned in the X-Skipped-Providers header so the frontend can warn
-// before/after download.
+// Generates a payout CSV, grouped by provider. Providers missing banking
+// details are silently skipped (can't be paid by any of these files); the
+// count is returned in the X-Skipped-Providers header so the frontend can
+// warn before/after download.
 //
-// Default (no query param) is a bank-upload file: UNPAID (status =
+// Default (no query param) is now the FULL review export: every field
+// collected on the provider Payment Info form, not just the subset the
+// bank-upload file's fixed 10-column layout actually uses, and it includes
+// already-paid transactions (a review is pointless if it silently excludes
+// them). This is the client's requested default so they can see everything
+// currently collected and say what to drop — it is NOT meant for bank
+// upload, and masks account/ABA numbers accordingly.
+//
+// ?bank=1 is the actual Scotiabank-bound EFT batch file — see the
+// field-mapping comment below, a best-effort CSV wrapper over Jamaica's
+// JCBA/ACH PPD Entry Detail fields (documentation/PAYMENTS_AND_JOB_WORKFLOW.md
+// §3), NOT yet confirmed against Scotiabank's actual upload template. Its
+// 10-column layout is kept exactly as before so adding a feature here can't
+// be the thing that gets a real file rejected by the bank. UNPAID (status =
 // 'completed') transactions only, so an admin can never re-upload a batch
-// that was already paid and double-pay a provider. For the original
+// that was already paid and double-pay a provider; account numbers are left
+// unmasked since this file is the actual bank submission. For the original
 // "CSV is empty" case — a week that's already fully paid — this file is
-// correctly empty; there's nothing left to pay.
+// correctly empty; there's nothing left to pay. This is the only mode that
+// lazily creates/updates the payout_batches row and links transactions to
+// it, so an admin running a real payout must use ?bank=1, not the default.
 //
-// ?includePaid=1 switches to a records-only export (NOT meant for bank
-// upload) that also includes already-paid transactions so admins can
-// still get a non-empty CSV for a paid week's records. Its Amount column
-// still only ever sums the UNPAID portion (via FILTER), so even in this
-// mode the figure can never include money that's already been sent; an
-// extra Status column (UNPAID / ALREADY PAID / MIXED - PARTIALLY PAID)
-// says what the rest of that provider's row represents. This column only
-// appears in records mode, so the bank-bound file's layout never changes.
-//
-// ?full=1 is a review export ONLY — every field collected on the provider
-// Payment Info form, not just the subset the bank-upload file's fixed
-// 10-column layout actually uses. This exists so the client can see
-// everything we collect and tell us what to drop, without ever touching
-// (or risking breaking) the real bank-upload format above. Implies
-// includePaid's "show everyone" behavior — a review is pointless if it
-// silently excludes already-paid providers.
+// ?includePaid=1 (without ?bank=1) is a records-only export, included for
+// backward compatibility — also includes already-paid transactions and
+// masks the account number, but without the full set of extra fields.
 // ============================================================
 router.get('/:weekStart/export-csv', async (req, res) => {
   const { weekStart } = req.params;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(weekStart) || !isMonday(weekStart)) {
     return res.status(400).json({ success: false, message: 'weekStart must be a YYYY-MM-DD Monday.' });
   }
-  const fullReview = req.query.full === '1';
-  const includePaid = fullReview || req.query.includePaid === '1';
+  const bankOnly = req.query.bank === '1';
+  const fullReview = !bankOnly && req.query.includePaid !== '1';
+  const includePaid = !bankOnly;
   const statuses = includePaid ? PAYABLE_STATUSES : ['completed'];
   try {
     const result = await db.query(`
@@ -414,7 +412,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
     }
     const csv = csvLines.join('\r\n');
 
-    const filenameSuffix = fullReview ? '-full-review' : (includePaid ? '-records' : '');
+    const filenameSuffix = fullReview ? '-full-review' : (includePaid ? '-records' : '-bank-upload');
     res.set('Content-Type', 'text/csv; charset=utf-8');
     res.set('Content-Disposition', `attachment; filename="tendrit-payout-${weekStart}${filenameSuffix}.csv"`);
     res.set('X-Skipped-Providers', String(skipped));
