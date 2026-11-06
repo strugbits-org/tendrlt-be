@@ -232,13 +232,22 @@ router.patch('/mark-paid', async (req, res) => {
 // extra Status column (UNPAID / ALREADY PAID / MIXED - PARTIALLY PAID)
 // says what the rest of that provider's row represents. This column only
 // appears in records mode, so the bank-bound file's layout never changes.
+//
+// ?full=1 is a review export ONLY — every field collected on the provider
+// Payment Info form, not just the subset the bank-upload file's fixed
+// 10-column layout actually uses. This exists so the client can see
+// everything we collect and tell us what to drop, without ever touching
+// (or risking breaking) the real bank-upload format above. Implies
+// includePaid's "show everyone" behavior — a review is pointless if it
+// silently excludes already-paid providers.
 // ============================================================
 router.get('/:weekStart/export-csv', async (req, res) => {
   const { weekStart } = req.params;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(weekStart) || !isMonday(weekStart)) {
     return res.status(400).json({ success: false, message: 'weekStart must be a YYYY-MM-DD Monday.' });
   }
-  const includePaid = req.query.includePaid === '1';
+  const fullReview = req.query.full === '1';
+  const includePaid = fullReview || req.query.includePaid === '1';
   const statuses = includePaid ? PAYABLE_STATUSES : ['completed'];
   try {
     const result = await db.query(`
@@ -251,7 +260,8 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         bool_or(tx.status = 'paid') AS any_paid,
         pd.payee_first_name, pd.middle_initial, pd.payee_surname, pd.business_name, pd.account_ownership,
         pd.recipient_id, pd.bank_name, pd.transit_code, pd.account_type,
-        pd.account_number_encrypted
+        pd.account_number_encrypted,
+        pd.swift_code, pd.bank_branch, pd.bank_address, pd.currency, pd.aba_routing_encrypted
       FROM public.transactions tx
       LEFT JOIN public.provider_payment_details pd ON pd.provider_id = tx.provider_id
       WHERE tx.status = ANY($2::transaction_status[])
@@ -259,7 +269,8 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         AND tx.completed_at < (($1::date + INTERVAL '7 days') AT TIME ZONE 'America/Jamaica')
       GROUP BY tx.provider_id, pd.payee_first_name, pd.middle_initial, pd.payee_surname,
                pd.business_name, pd.account_ownership, pd.recipient_id, pd.bank_name,
-               pd.transit_code, pd.account_type, pd.account_number_encrypted
+               pd.transit_code, pd.account_type, pd.account_number_encrypted,
+               pd.swift_code, pd.bank_branch, pd.bank_address, pd.currency, pd.aba_routing_encrypted
     `, [weekStart, statuses]);
 
     const weekEnd = new Date(weekStart);
@@ -288,9 +299,9 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       // CSV has no BOM, and Excel (which ignores the Content-Type charset
       // for a downloaded file) would otherwise render a multi-byte
       // character as mojibake.
+      const mask = (digits) => (digits.length <= 4 ? digits : '*'.repeat(digits.length - 4) + digits.slice(-4));
       if (includePaid && accountNumber) {
-        const digits = String(accountNumber);
-        accountNumber = digits.length <= 4 ? digits : '*'.repeat(digits.length - 4) + digits.slice(-4);
+        accountNumber = mask(String(accountNumber));
       }
 
       const payeeName = r.account_ownership === 'business' && r.business_name
@@ -312,6 +323,26 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         weekStart,
       ];
       if (includePaid) row.push(r.all_paid ? 'ALREADY PAID' : r.any_paid ? 'MIXED - PARTIALLY PAID' : 'UNPAID');
+
+      if (fullReview) {
+        // Same masking treatment as the account number — this file is for
+        // review, not a real transfer, so neither banking identifier needs
+        // to leave the system in full.
+        let aba = '';
+        if (r.aba_routing_encrypted) {
+          try { aba = mask(String(paymentCrypto.decrypt(r.aba_routing_encrypted))); }
+          catch (decErr) { console.error('Payout CSV review decrypt (ABA) failed for provider', r.provider_id, decErr.message); }
+        }
+        row.push(
+          r.account_ownership || '',
+          r.business_name || '',
+          r.swift_code || '',
+          r.bank_branch || '',
+          r.bank_address || '',
+          aba,
+          (r.currency || 'jmd').toUpperCase(),
+        );
+      }
       rows.push(row);
     }
 
@@ -354,7 +385,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       } catch (logErr) {
         console.error('Failed to record payout_csv_export_log entry:', logErr.message);
       }
-      console.log(`Records-mode payout CSV exported for week ${weekStart} by admin ${req.user.id} at ${new Date().toISOString()}`);
+      console.log(`${fullReview ? 'Full-review' : 'Records-mode'} payout CSV exported for week ${weekStart} by admin ${req.user.id} at ${new Date().toISOString()}`);
     }
 
     const header = [
@@ -362,6 +393,12 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       'Account Type', 'Account Number', 'Amount', 'Currency', 'Reference', 'Payment Date',
     ];
     if (includePaid) header.push('Status');
+    if (fullReview) {
+      header.push(
+        'Account Ownership', 'Business Name', 'SWIFT/BIC Code', 'Bank Branch',
+        'Bank Branch Address', 'ABA/Routing Number', 'Account Currency'
+      );
+    }
     const csvLines = [header, ...rows].map((row) =>
       row.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')
     );
@@ -371,12 +408,15 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       // it's still easy to mistake for the bank file at a glance. This
       // banner is a harmless extra "column" to any real CSV parser/bank
       // template, since it never reaches the bank-upload path.
-      csvLines.unshift('"FOR INTERNAL RECORDS ONLY - DO NOT UPLOAD TO BANK"');
+      csvLines.unshift(fullReview
+        ? '"FOR INTERNAL REVIEW ONLY - EVERY COLLECTED FIELD - DO NOT UPLOAD TO BANK"'
+        : '"FOR INTERNAL RECORDS ONLY - DO NOT UPLOAD TO BANK"');
     }
     const csv = csvLines.join('\r\n');
 
+    const filenameSuffix = fullReview ? '-full-review' : (includePaid ? '-records' : '');
     res.set('Content-Type', 'text/csv; charset=utf-8');
-    res.set('Content-Disposition', `attachment; filename="tendrit-payout-${weekStart}${includePaid ? '-records' : ''}.csv"`);
+    res.set('Content-Disposition', `attachment; filename="tendrit-payout-${weekStart}${filenameSuffix}.csv"`);
     res.set('X-Skipped-Providers', String(skipped));
     res.set('X-Already-Paid-Providers', String(alreadyPaidCount));
     res.send(csv);
