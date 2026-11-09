@@ -290,16 +290,17 @@ router.get('/:weekStart/export-csv', async (req, res) => {
     const mask = (digits) => (digits.length <= 4 ? digits : '*'.repeat(digits.length - 4) + digits.slice(-4));
 
     // CSV/formula injection: a free-text field (bank_name, bank_branch,
-    // bank_address, business_name, etc. all allow an "Other" manual-entry
-    // fallback on the provider's Payment Info form) starting with =, +, -,
-    // or @ is interpreted as a formula by Excel/Sheets when this file is
-    // opened — which is the expected workflow for the review/records
-    // exports. Prefixing with a quote keeps it inert text without changing
-    // the visible value. Left out of the bank-upload file so that format
-    // never changes.
+    // bank_address, business_name, recipient_id, transit_code, etc. all
+    // allow an "Other" manual-entry fallback on the provider's Payment
+    // Info form) starting with =, +, -, @, a tab, or a carriage return is
+    // interpreted as a formula (or used to smuggle a second line) by
+    // Excel/Sheets when this file is opened — which is the expected
+    // workflow for the review/records exports. Prefixing with a quote
+    // keeps it inert text without changing the visible value. Left out of
+    // the bank-upload file so that format never changes.
     const csvSafe = (v) => {
       const s = String(v);
-      return /^[=+\-@]/.test(s) ? `'${s}` : s;
+      return /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
     };
 
     const rows = [];
@@ -324,11 +325,15 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       let payeeName = r.account_ownership === 'business' && r.business_name
         ? r.business_name
         : [r.payee_first_name, r.middle_initial, r.payee_surname].filter(Boolean).join(' ');
+      let recipientIdCell = r.recipient_id || '';
       let bankNameCell = r.bank_name || '';
+      let transitCodeCell = r.transit_code || '';
       let accountTypeCell = r.account_type || '';
       if (includePaid) {
         payeeName = csvSafe(payeeName);
+        recipientIdCell = csvSafe(recipientIdCell);
         bankNameCell = csvSafe(bankNameCell);
+        transitCodeCell = csvSafe(transitCodeCell);
         accountTypeCell = csvSafe(accountTypeCell);
       }
 
@@ -336,9 +341,9 @@ router.get('/:weekStart/export-csv', async (req, res) => {
 
       const row = [
         payeeName,
-        r.recipient_id || '',
+        recipientIdCell,
         bankNameCell,
-        r.transit_code || '',
+        transitCodeCell,
         accountTypeCell,
         accountNumber || '',
         (Number(r.provider_payout_cents) / 100).toFixed(2),
@@ -370,7 +375,9 @@ router.get('/:weekStart/export-csv', async (req, res) => {
           csvSafe(r.bank_branch || ''),
           csvSafe(r.bank_address || ''),
           aba,
-          (r.currency || 'jmd').toUpperCase(),
+          // This export's purpose is showing what's actually on file, so an
+          // absent currency is left blank rather than assumed to be JMD.
+          r.currency ? r.currency.toUpperCase() : '',
         );
       }
       rows.push(row);
