@@ -314,6 +314,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
     const rows = [];
     let skipped = 0;
     let alreadyPaidCount = 0;
+    let auditLogFailed = false;
     for (const r of result.rows) {
       const hasBanking = r.account_number_encrypted && r.bank_name && r.transit_code;
       if (!hasBanking) { skipped++; continue; }
@@ -367,8 +368,14 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         // to leave the system in full.
         let aba = '';
         if (r.aba_routing_encrypted) {
-          try { aba = mask(String(paymentCrypto.decrypt(r.aba_routing_encrypted))); }
-          catch (decErr) {
+          try {
+            const decrypted = paymentCrypto.decrypt(r.aba_routing_encrypted);
+            // Guard against a falsy decrypted value (e.g. an empty string
+            // that was somehow stored encrypted) — mask(String(null)) would
+            // otherwise render as literal masked "null" text rather than
+            // the blank cell that actually reflects "nothing to show".
+            aba = decrypted ? mask(String(decrypted)) : '';
+          } catch (decErr) {
             console.error('Payout CSV review decrypt (ABA) failed for provider', r.provider_id, decErr.message);
             // A blank cell here would read identically to "no ABA on file" —
             // this file's whole purpose is showing what's actually collected,
@@ -420,15 +427,21 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       // (payout_csv_export_log, see its migration) rather than only
       // console.log, which is lost on log rotation/restart. Best-effort:
       // a logging failure shouldn't block an admin from getting their
-      // export, so it's caught and reported separately from the main
-      // try/catch's "Failed to generate CSV" response.
+      // export (e.g. this deploying ahead of its migration shouldn't make
+      // the feature unusable), so it's caught and reported separately from
+      // the main try/catch's "Failed to generate CSV" response. The
+      // X-Audit-Log-Failed header surfaces the gap to the caller instead of
+      // only a server log line, since silently losing the audit trail for
+      // a full-field banking export (SWIFT/branch/address/ABA) matters more
+      // than for a routine records pull.
       try {
         await db.query(
           `INSERT INTO public.payout_csv_export_log (week_start, admin_id, export_mode) VALUES ($1, $2, $3)`,
           [weekStart, req.user.id, fullReview ? 'full' : 'records']
         );
       } catch (logErr) {
-        console.error('Failed to record payout_csv_export_log entry:', logErr.message);
+        console.error(`Failed to record payout_csv_export_log entry (mode=${fullReview ? 'full' : 'records'}):`, logErr.message);
+        auditLogFailed = true;
       }
       console.log(`${fullReview ? 'Full-review' : 'Records-mode'} payout CSV exported for week ${weekStart} by admin ${req.user.id} at ${new Date().toISOString()}`);
     }
@@ -464,6 +477,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
     res.set('Content-Disposition', `attachment; filename="tendrit-payout-${weekStart}${filenameSuffix}.csv"`);
     res.set('X-Skipped-Providers', String(skipped));
     res.set('X-Already-Paid-Providers', String(alreadyPaidCount));
+    if (auditLogFailed) res.set('X-Audit-Log-Failed', '1');
     res.send(csv);
   } catch (err) {
     console.error('GET /api/admin/payouts/:weekStart/export-csv error:', err);
