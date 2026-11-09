@@ -207,39 +207,62 @@ router.patch('/mark-paid', async (req, res) => {
 
 // ============================================================
 // GET /api/admin/payouts/:weekStart/export-csv
-// Generates a Scotiabank-bound EFT batch CSV, grouped by provider. See the
-// field-mapping comment below — this is a best-effort CSV wrapper over
-// Jamaica's JCBA/ACH PPD Entry Detail fields
-// (documentation/PAYMENTS_AND_JOB_WORKFLOW.md §3), NOT yet confirmed
-// against Scotiabank's actual upload template; its 10-column layout is
-// kept exactly as before so adding a feature here can't be the thing that
-// gets a real file rejected by the bank. Providers missing banking details
-// are silently skipped (can't be paid by this file); the count is
-// returned in the X-Skipped-Providers header so the frontend can warn
-// before/after download.
+// Generates a payout CSV, grouped by provider. Providers missing banking
+// details are silently skipped (can't be paid by any of these files); the
+// count is returned in the X-Skipped-Providers header so the frontend can
+// warn before/after download.
 //
-// Default (no query param) is a bank-upload file: UNPAID (status =
+// Default (no query param) is now the FULL review export: every field
+// collected on the provider Payment Info form, not just the subset the
+// bank-upload file's fixed 10-column layout actually uses, and it includes
+// already-paid transactions (a review is pointless if it silently excludes
+// them). This is the client's requested default so they can see everything
+// currently collected — and, per the client, they intend to actually test-
+// upload this file to Scotiabank to learn its real field/fee requirements,
+// so it carries no "do not upload" banner. Still masks account/ABA numbers.
+//
+// ?bank=1 is the actual Scotiabank-bound EFT batch file — see the
+// field-mapping comment below, a best-effort CSV wrapper over Jamaica's
+// JCBA/ACH PPD Entry Detail fields (documentation/PAYMENTS_AND_JOB_WORKFLOW.md
+// §3), NOT yet confirmed against Scotiabank's actual upload template. Its
+// 10-column layout is kept exactly as before so adding a feature here can't
+// be the thing that gets a real file rejected by the bank. UNPAID (status =
 // 'completed') transactions only, so an admin can never re-upload a batch
-// that was already paid and double-pay a provider. For the original
+// that was already paid and double-pay a provider; account numbers are left
+// unmasked since this file is the actual bank submission. For the original
 // "CSV is empty" case — a week that's already fully paid — this file is
-// correctly empty; there's nothing left to pay.
+// correctly empty; there's nothing left to pay. This is the only mode that
+// lazily creates/updates the payout_batches row and links transactions to
+// it, so an admin running a real payout must use ?bank=1, not the default.
 //
-// ?includePaid=1 switches to a records-only export (NOT meant for bank
-// upload) that also includes already-paid transactions so admins can
-// still get a non-empty CSV for a paid week's records. Its Amount column
-// still only ever sums the UNPAID portion (via FILTER), so even in this
-// mode the figure can never include money that's already been sent; an
-// extra Status column (UNPAID / ALREADY PAID / MIXED - PARTIALLY PAID)
-// says what the rest of that provider's row represents. This column only
-// appears in records mode, so the bank-bound file's layout never changes.
+// ?includePaid=1 (without ?bank=1) is a records-only export, included for
+// backward compatibility — also includes already-paid transactions and
+// masks the account number, but without the full set of extra fields.
 // ============================================================
 router.get('/:weekStart/export-csv', async (req, res) => {
   const { weekStart } = req.params;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(weekStart) || !isMonday(weekStart)) {
     return res.status(400).json({ success: false, message: 'weekStart must be a YYYY-MM-DD Monday.' });
   }
-  const includePaid = req.query.includePaid === '1';
-  const statuses = includePaid ? PAYABLE_STATUSES : ['completed'];
+  // ?bank=1 always wins if sent alongside ?includePaid=1 or no other
+  // params: bankOnly is decided first and everything else derives from
+  // it, so an explicit request for the real bank submission can never be
+  // downgraded into a masked review/records file.
+  const bankOnly = req.query.bank === '1';
+  const fullReview = !bankOnly && req.query.includePaid !== '1';
+  // True for both non-bank modes (full review and ?includePaid=1 records
+  // mode) — named for "not the real bank file" rather than "includes paid
+  // rows", since it also gates masking the account number, which
+  // `includePaid` no longer described once it took on that second job.
+  const nonBank = !bankOnly;
+  const statuses = nonBank ? PAYABLE_STATUSES : ['completed'];
+  // The full-review-only columns (SWIFT, branch, address, currency, ABA)
+  // exist on provider_payment_details since its original migration, not
+  // something this feature added — but ?bank=1 (the real bank submission)
+  // has no use for them, so they're only fetched/decrypted when fullReview
+  // actually needs them, keeping that path's PII surface unchanged.
+  const extraCols = fullReview ? ', pd.swift_code, pd.bank_branch, pd.bank_address, pd.currency, pd.aba_routing_encrypted' : '';
+  const extraGroupBy = fullReview ? ', pd.swift_code, pd.bank_branch, pd.bank_address, pd.currency, pd.aba_routing_encrypted' : '';
   try {
     const result = await db.query(`
       SELECT
@@ -251,7 +274,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         bool_or(tx.status = 'paid') AS any_paid,
         pd.payee_first_name, pd.middle_initial, pd.payee_surname, pd.business_name, pd.account_ownership,
         pd.recipient_id, pd.bank_name, pd.transit_code, pd.account_type,
-        pd.account_number_encrypted
+        pd.account_number_encrypted${extraCols}
       FROM public.transactions tx
       LEFT JOIN public.provider_payment_details pd ON pd.provider_id = tx.provider_id
       WHERE tx.status = ANY($2::transaction_status[])
@@ -259,15 +282,40 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         AND tx.completed_at < (($1::date + INTERVAL '7 days') AT TIME ZONE 'America/Jamaica')
       GROUP BY tx.provider_id, pd.payee_first_name, pd.middle_initial, pd.payee_surname,
                pd.business_name, pd.account_ownership, pd.recipient_id, pd.bank_name,
-               pd.transit_code, pd.account_type, pd.account_number_encrypted
+               pd.transit_code, pd.account_type, pd.account_number_encrypted${extraGroupBy}
     `, [weekStart, statuses]);
 
     const weekEnd = new Date(weekStart);
     weekEnd.setDate(weekEnd.getDate() + 6);
 
+    // Records mode isn't a bank submission, so it has no need for the
+    // full account number — only the bank-upload file (below) needs it
+    // verbatim. Masking everything but the last 4 digits here limits
+    // exposure if this file is ever shared/stored less carefully than
+    // the actual bank file. Plain '*' rather than a UTF-8 bullet: this
+    // CSV has no BOM, and Excel (which ignores the Content-Type charset
+    // for a downloaded file) would otherwise render a multi-byte
+    // character as mojibake.
+    const mask = (digits) => (digits.length <= 4 ? digits : '*'.repeat(digits.length - 4) + digits.slice(-4));
+
+    // CSV/formula injection: a free-text field (bank_name, bank_branch,
+    // bank_address, business_name, recipient_id, transit_code, etc. all
+    // allow an "Other" manual-entry fallback on the provider's Payment
+    // Info form) starting with =, +, -, @, a tab, or a carriage return is
+    // interpreted as a formula (or used to smuggle a second line) by
+    // Excel/Sheets when this file is opened — which is the expected
+    // workflow for the review/records exports. Prefixing with a quote
+    // keeps it inert text without changing the visible value. Left out of
+    // the bank-upload file so that format never changes.
+    const csvSafe = (v) => {
+      const s = String(v);
+      return /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+    };
+
     const rows = [];
     let skipped = 0;
     let alreadyPaidCount = 0;
+    let auditLogFailed = false;
     for (const r of result.rows) {
       const hasBanking = r.account_number_encrypted && r.bank_name && r.transit_code;
       if (!hasBanking) { skipped++; continue; }
@@ -280,45 +328,79 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         skipped++;
         continue;
       }
-      // Records mode isn't a bank submission, so it has no need for the
-      // full account number — only the bank-upload file (below) needs it
-      // verbatim. Masking everything but the last 4 digits here limits
-      // exposure if this file is ever shared/stored less carefully than
-      // the actual bank file. Plain '*' rather than a UTF-8 bullet: this
-      // CSV has no BOM, and Excel (which ignores the Content-Type charset
-      // for a downloaded file) would otherwise render a multi-byte
-      // character as mojibake.
-      if (includePaid && accountNumber) {
-        const digits = String(accountNumber);
-        accountNumber = digits.length <= 4 ? digits : '*'.repeat(digits.length - 4) + digits.slice(-4);
+      if (nonBank && accountNumber) {
+        accountNumber = mask(String(accountNumber));
       }
 
-      const payeeName = r.account_ownership === 'business' && r.business_name
+      let payeeName = r.account_ownership === 'business' && r.business_name
         ? r.business_name
         : [r.payee_first_name, r.middle_initial, r.payee_surname].filter(Boolean).join(' ');
+      let recipientIdCell = r.recipient_id || '';
+      let bankNameCell = r.bank_name || '';
+      let transitCodeCell = r.transit_code || '';
+      let accountTypeCell = r.account_type || '';
+      if (nonBank) {
+        payeeName = csvSafe(payeeName);
+        recipientIdCell = csvSafe(recipientIdCell);
+        bankNameCell = csvSafe(bankNameCell);
+        transitCodeCell = csvSafe(transitCodeCell);
+        accountTypeCell = csvSafe(accountTypeCell);
+      }
 
       if (r.all_paid) alreadyPaidCount++;
 
       const row = [
         payeeName,
-        r.recipient_id || '',
-        r.bank_name || '',
-        r.transit_code || '',
-        r.account_type || '',
+        recipientIdCell,
+        bankNameCell,
+        transitCodeCell,
+        accountTypeCell,
         accountNumber || '',
         (Number(r.provider_payout_cents) / 100).toFixed(2),
         'JMD',
         `TendrIt Payout WK${weekStart}`,
         weekStart,
       ];
-      if (includePaid) row.push(r.all_paid ? 'ALREADY PAID' : r.any_paid ? 'MIXED - PARTIALLY PAID' : 'UNPAID');
+      if (fullReview) {
+        // Same masking treatment as the account number — this file is for
+        // review, not a real transfer, so neither banking identifier needs
+        // to leave the system in full.
+        let aba = '';
+        if (r.aba_routing_encrypted) {
+          try {
+            const decrypted = paymentCrypto.decrypt(r.aba_routing_encrypted);
+            // Guard against a falsy decrypted value (e.g. an empty string
+            // that was somehow stored encrypted) — mask(String(null)) would
+            // otherwise render as literal masked "null" text rather than
+            // the blank cell that actually reflects "nothing to show".
+            aba = decrypted ? mask(String(decrypted)) : '';
+          } catch (decErr) {
+            console.error('Payout CSV review decrypt (ABA) failed for provider', r.provider_id, decErr.message);
+            // A blank cell here would read identically to "no ABA on file" —
+            // this file's whole purpose is showing what's actually collected,
+            // so a decrypt failure needs its own distinguishable marker.
+            aba = 'DECRYPT ERROR';
+          }
+        }
+        row.push(
+          csvSafe(r.account_ownership || ''),
+          csvSafe(r.business_name || ''),
+          csvSafe(r.swift_code || ''),
+          csvSafe(r.bank_branch || ''),
+          csvSafe(r.bank_address || ''),
+          aba,
+          // This export's purpose is showing what's actually on file, so an
+          // absent currency is left blank rather than assumed to be JMD.
+          r.currency ? r.currency.toUpperCase() : '',
+        );
+      }
       rows.push(row);
     }
 
     // Lazily create/update the payout_batches row so repeated downloads and
     // the mark-paid flow share one identity for this week. Records-mode
     // exports don't touch this — they're not a bank submission.
-    if (!includePaid) {
+    if (!nonBank) {
       await db.query(
         `INSERT INTO public.payout_batches (week_start, week_end, created_by, csv_downloaded_at)
          VALUES ($1, $2, $3, NOW())
@@ -344,41 +426,55 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       // (payout_csv_export_log, see its migration) rather than only
       // console.log, which is lost on log rotation/restart. Best-effort:
       // a logging failure shouldn't block an admin from getting their
-      // export, so it's caught and reported separately from the main
-      // try/catch's "Failed to generate CSV" response.
+      // export (e.g. this deploying ahead of its migration shouldn't make
+      // the feature unusable), so it's caught and reported separately from
+      // the main try/catch's "Failed to generate CSV" response. The
+      // X-Audit-Log-Failed header surfaces the gap to the caller instead of
+      // only a server log line, since silently losing the audit trail for
+      // a full-field banking export (SWIFT/branch/address/ABA) matters more
+      // than for a routine records pull.
       try {
         await db.query(
-          `INSERT INTO public.payout_csv_export_log (week_start, admin_id) VALUES ($1, $2)`,
-          [weekStart, req.user.id]
+          `INSERT INTO public.payout_csv_export_log (week_start, admin_id, export_mode) VALUES ($1, $2, $3)`,
+          [weekStart, req.user.id, fullReview ? 'full' : 'records']
         );
       } catch (logErr) {
-        console.error('Failed to record payout_csv_export_log entry:', logErr.message);
+        console.error(`Failed to record payout_csv_export_log entry (mode=${fullReview ? 'full' : 'records'}):`, logErr.message);
+        auditLogFailed = true;
       }
-      console.log(`Records-mode payout CSV exported for week ${weekStart} by admin ${req.user.id} at ${new Date().toISOString()}`);
+      console.log(`${fullReview ? 'Full-review' : 'Records-mode'} payout CSV exported for week ${weekStart} by admin ${req.user.id} at ${new Date().toISOString()}`);
     }
 
     const header = [
       'Payee Name', 'Individual ID (TRN)', 'Bank Name', 'Transit Code',
       'Account Type', 'Account Number', 'Amount', 'Currency', 'Reference', 'Payment Date',
     ];
-    if (includePaid) header.push('Status');
+    if (fullReview) {
+      header.push(
+        'Account Ownership', 'Business Name', 'SWIFT/BIC Code', 'Bank Branch',
+        'Bank Branch Address', 'ABA/Routing Number', 'Account Currency'
+      );
+    }
+    // No "do not upload to bank" banner line: per the client, the full
+    // export is intended to actually be test-uploaded to Scotiabank to
+    // learn its real field/fee requirements, so a disclaimer here would be
+    // actively wrong rather than just unnecessary.
     const csvLines = [header, ...rows].map((row) =>
       row.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')
     );
-    if (includePaid) {
-      // A clearer marker than the filename suffix alone: Amount is 0 for
-      // fully-paid rows here and the Status column changes the layout, but
-      // it's still easy to mistake for the bank file at a glance. This
-      // banner is a harmless extra "column" to any real CSV parser/bank
-      // template, since it never reaches the bank-upload path.
-      csvLines.unshift('"FOR INTERNAL RECORDS ONLY - DO NOT UPLOAD TO BANK"');
-    }
     const csv = csvLines.join('\r\n');
 
+    const filenameSuffix = fullReview ? '-full-review' : (nonBank ? '-records' : '-bank-upload');
     res.set('Content-Type', 'text/csv; charset=utf-8');
-    res.set('Content-Disposition', `attachment; filename="tendrit-payout-${weekStart}${includePaid ? '-records' : ''}.csv"`);
+    res.set('Content-Disposition', `attachment; filename="tendrit-payout-${weekStart}${filenameSuffix}.csv"`);
     res.set('X-Skipped-Providers', String(skipped));
     res.set('X-Already-Paid-Providers', String(alreadyPaidCount));
+    if (auditLogFailed) res.set('X-Audit-Log-Failed', '1');
+    // Echoes which mode was actually served, so the frontend can detect a
+    // version mismatch (e.g. a stale backend that doesn't recognize ?full=1
+    // yet and silently falls back to its old bank-file default) instead of
+    // handing out a file under the wrong label.
+    res.set('X-Export-Mode', bankOnly ? 'bank' : (fullReview ? 'full' : 'records'));
     res.send(csv);
   } catch (err) {
     console.error('GET /api/admin/payouts/:weekStart/export-csv error:', err);
