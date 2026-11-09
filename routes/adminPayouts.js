@@ -274,6 +274,16 @@ router.get('/:weekStart/export-csv', async (req, res) => {
     const weekEnd = new Date(weekStart);
     weekEnd.setDate(weekEnd.getDate() + 6);
 
+    // Records mode isn't a bank submission, so it has no need for the
+    // full account number — only the bank-upload file (below) needs it
+    // verbatim. Masking everything but the last 4 digits here limits
+    // exposure if this file is ever shared/stored less carefully than
+    // the actual bank file. Plain '*' rather than a UTF-8 bullet: this
+    // CSV has no BOM, and Excel (which ignores the Content-Type charset
+    // for a downloaded file) would otherwise render a multi-byte
+    // character as mojibake.
+    const mask = (digits) => (digits.length <= 4 ? digits : '*'.repeat(digits.length - 4) + digits.slice(-4));
+
     const rows = [];
     let skipped = 0;
     let alreadyPaidCount = 0;
@@ -289,15 +299,6 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         skipped++;
         continue;
       }
-      // Records mode isn't a bank submission, so it has no need for the
-      // full account number — only the bank-upload file (below) needs it
-      // verbatim. Masking everything but the last 4 digits here limits
-      // exposure if this file is ever shared/stored less carefully than
-      // the actual bank file. Plain '*' rather than a UTF-8 bullet: this
-      // CSV has no BOM, and Excel (which ignores the Content-Type charset
-      // for a downloaded file) would otherwise render a multi-byte
-      // character as mojibake.
-      const mask = (digits) => (digits.length <= 4 ? digits : '*'.repeat(digits.length - 4) + digits.slice(-4));
       if (includePaid && accountNumber) {
         accountNumber = mask(String(accountNumber));
       }
@@ -329,7 +330,13 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         let aba = '';
         if (r.aba_routing_encrypted) {
           try { aba = mask(String(paymentCrypto.decrypt(r.aba_routing_encrypted))); }
-          catch (decErr) { console.error('Payout CSV review decrypt (ABA) failed for provider', r.provider_id, decErr.message); }
+          catch (decErr) {
+            console.error('Payout CSV review decrypt (ABA) failed for provider', r.provider_id, decErr.message);
+            // A blank cell here would read identically to "no ABA on file" —
+            // this file's whole purpose is showing what's actually collected,
+            // so a decrypt failure needs its own distinguishable marker.
+            aba = 'DECRYPT ERROR';
+          }
         }
         row.push(
           r.account_ownership || '',
@@ -377,8 +384,8 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       // try/catch's "Failed to generate CSV" response.
       try {
         await db.query(
-          `INSERT INTO public.payout_csv_export_log (week_start, admin_id) VALUES ($1, $2)`,
-          [weekStart, req.user.id]
+          `INSERT INTO public.payout_csv_export_log (week_start, admin_id, export_mode) VALUES ($1, $2, $3)`,
+          [weekStart, req.user.id, fullReview ? 'full' : 'records']
         );
       } catch (logErr) {
         console.error('Failed to record payout_csv_export_log entry:', logErr.message);
