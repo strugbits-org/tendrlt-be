@@ -361,8 +361,6 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         `TendrIt Payout WK${weekStart}`,
         weekStart,
       ];
-      if (nonBank) row.push(r.all_paid ? 'ALREADY PAID' : r.any_paid ? 'MIXED - PARTIALLY PAID' : 'UNPAID');
-
       if (fullReview) {
         // Same masking treatment as the account number — this file is for
         // review, not a real transfer, so neither banking identifier needs
@@ -451,7 +449,6 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       'Payee Name', 'Individual ID (TRN)', 'Bank Name', 'Transit Code',
       'Account Type', 'Account Number', 'Amount', 'Currency', 'Reference', 'Payment Date',
     ];
-    if (nonBank) header.push('Status');
     if (fullReview) {
       header.push(
         'Account Ownership', 'Business Name', 'SWIFT/BIC Code', 'Bank Branch',
