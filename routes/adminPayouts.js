@@ -243,14 +243,16 @@ router.get('/:weekStart/export-csv', async (req, res) => {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(weekStart) || !isMonday(weekStart)) {
     return res.status(400).json({ success: false, message: 'weekStart must be a YYYY-MM-DD Monday.' });
   }
+  // ?bank=1 always wins if sent alongside ?includePaid=1 or no other
+  // params: bankOnly is decided first and everything else derives from
+  // it, so an explicit request for the real bank submission can never be
+  // downgraded into a masked review/records file.
   const bankOnly = req.query.bank === '1';
   const fullReview = !bankOnly && req.query.includePaid !== '1';
   // True for both non-bank modes (full review and ?includePaid=1 records
   // mode) — named for "not the real bank file" rather than "includes paid
-  // rows", since it also gates masking the account number. Named
-  // `includePaid` previously, which drifted from what it actually controls
-  // once it started gating masking too; renamed per bot review to avoid a
-  // future change accidentally unmasking account numbers.
+  // rows", since it also gates masking the account number, which
+  // `includePaid` no longer described once it took on that second job.
   const nonBank = !bankOnly;
   const statuses = nonBank ? PAYABLE_STATUSES : ['completed'];
   // The full-review-only columns (SWIFT, branch, address, currency, ABA)
