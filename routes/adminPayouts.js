@@ -217,8 +217,9 @@ router.patch('/mark-paid', async (req, res) => {
 // bank-upload file's fixed 10-column layout actually uses, and it includes
 // already-paid transactions (a review is pointless if it silently excludes
 // them). This is the client's requested default so they can see everything
-// currently collected and say what to drop — it is NOT meant for bank
-// upload, and masks account/ABA numbers accordingly.
+// currently collected — and, per the client, they intend to actually test-
+// upload this file to Scotiabank to learn its real field/fee requirements,
+// so it carries no "do not upload" banner. Still masks account/ABA numbers.
 //
 // ?bank=1 is the actual Scotiabank-bound EFT batch file — see the
 // field-mapping comment below, a best-effort CSV wrapper over Jamaica's
@@ -457,19 +458,13 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         'Bank Branch Address', 'ABA/Routing Number', 'Account Currency'
       );
     }
+    // No "do not upload to bank" banner line: per the client, the full
+    // export is intended to actually be test-uploaded to Scotiabank to
+    // learn its real field/fee requirements, so a disclaimer here would be
+    // actively wrong rather than just unnecessary.
     const csvLines = [header, ...rows].map((row) =>
       row.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')
     );
-    if (nonBank) {
-      // A clearer marker than the filename suffix alone: Amount is 0 for
-      // fully-paid rows here and the Status column changes the layout, but
-      // it's still easy to mistake for the bank file at a glance. This
-      // banner is a harmless extra "column" to any real CSV parser/bank
-      // template, since it never reaches the bank-upload path.
-      csvLines.unshift(fullReview
-        ? '"FOR INTERNAL REVIEW ONLY - EVERY COLLECTED FIELD - DO NOT UPLOAD TO BANK"'
-        : '"FOR INTERNAL RECORDS ONLY - DO NOT UPLOAD TO BANK"');
-    }
     const csv = csvLines.join('\r\n');
 
     const filenameSuffix = fullReview ? '-full-review' : (nonBank ? '-records' : '-bank-upload');
