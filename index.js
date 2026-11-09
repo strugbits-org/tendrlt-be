@@ -35,7 +35,7 @@ app.use(cors({
   // Headers object entirely — so routes/adminPayouts.js's X-Skipped-
   // Providers, X-Already-Paid-Providers, and X-Audit-Log-Failed headers
   // were being set by the server but silently unreadable by the frontend.
-  exposedHeaders: ['X-Skipped-Providers', 'X-Already-Paid-Providers', 'X-Audit-Log-Failed']
+  exposedHeaders: ['X-Skipped-Providers', 'X-Already-Paid-Providers', 'X-Audit-Log-Failed', 'X-Export-Mode']
 }));
 // Mounted before express.json() so this route's own express.raw() middleware
 // gets the untouched request body — needed to verify the Didit webhook

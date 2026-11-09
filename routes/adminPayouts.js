@@ -478,6 +478,11 @@ router.get('/:weekStart/export-csv', async (req, res) => {
     res.set('X-Skipped-Providers', String(skipped));
     res.set('X-Already-Paid-Providers', String(alreadyPaidCount));
     if (auditLogFailed) res.set('X-Audit-Log-Failed', '1');
+    // Echoes which mode was actually served, so the frontend can detect a
+    // version mismatch (e.g. a stale backend that doesn't recognize ?full=1
+    // yet and silently falls back to its old bank-file default) instead of
+    // handing out a file under the wrong label.
+    res.set('X-Export-Mode', bankOnly ? 'bank' : (fullReview ? 'full' : 'records'));
     res.send(csv);
   } catch (err) {
     console.error('GET /api/admin/payouts/:weekStart/export-csv error:', err);
