@@ -2,9 +2,9 @@
 -- payout_csv_export_log didn't distinguish which non-bank export mode was
 -- taken (records-only vs the newer full-review export, which additionally
 -- causes bank branch/address — PII-adjacent fields — to leave the system,
--- not just the account/ABA numbers records mode already exports).
--- Bot-reviewer-flagged: without this, the audit trail can't tell a routine
--- records pull apart from a full-field review export.
+-- not just the account/ABA numbers records mode already exports). Without
+-- this, the audit trail can't tell a routine records pull apart from a
+-- full-field review export.
 --
 -- 'bank' is included in the CHECK even though the current code never logs
 -- that mode to this table (it's tracked via payout_batches instead), so a

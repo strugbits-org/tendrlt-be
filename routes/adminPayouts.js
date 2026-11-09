@@ -245,8 +245,14 @@ router.get('/:weekStart/export-csv', async (req, res) => {
   }
   const bankOnly = req.query.bank === '1';
   const fullReview = !bankOnly && req.query.includePaid !== '1';
-  const includePaid = !bankOnly;
-  const statuses = includePaid ? PAYABLE_STATUSES : ['completed'];
+  // True for both non-bank modes (full review and ?includePaid=1 records
+  // mode) — named for "not the real bank file" rather than "includes paid
+  // rows", since it also gates masking the account number. Named
+  // `includePaid` previously, which drifted from what it actually controls
+  // once it started gating masking too; renamed per bot review to avoid a
+  // future change accidentally unmasking account numbers.
+  const nonBank = !bankOnly;
+  const statuses = nonBank ? PAYABLE_STATUSES : ['completed'];
   // The full-review-only columns (SWIFT, branch, address, currency, ABA)
   // exist on provider_payment_details since its original migration, not
   // something this feature added — but ?bank=1 (the real bank submission)
@@ -318,7 +324,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         skipped++;
         continue;
       }
-      if (includePaid && accountNumber) {
+      if (nonBank && accountNumber) {
         accountNumber = mask(String(accountNumber));
       }
 
@@ -329,7 +335,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       let bankNameCell = r.bank_name || '';
       let transitCodeCell = r.transit_code || '';
       let accountTypeCell = r.account_type || '';
-      if (includePaid) {
+      if (nonBank) {
         payeeName = csvSafe(payeeName);
         recipientIdCell = csvSafe(recipientIdCell);
         bankNameCell = csvSafe(bankNameCell);
@@ -351,7 +357,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         `TendrIt Payout WK${weekStart}`,
         weekStart,
       ];
-      if (includePaid) row.push(r.all_paid ? 'ALREADY PAID' : r.any_paid ? 'MIXED - PARTIALLY PAID' : 'UNPAID');
+      if (nonBank) row.push(r.all_paid ? 'ALREADY PAID' : r.any_paid ? 'MIXED - PARTIALLY PAID' : 'UNPAID');
 
       if (fullReview) {
         // Same masking treatment as the account number — this file is for
@@ -386,7 +392,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
     // Lazily create/update the payout_batches row so repeated downloads and
     // the mark-paid flow share one identity for this week. Records-mode
     // exports don't touch this — they're not a bank submission.
-    if (!includePaid) {
+    if (!nonBank) {
       await db.query(
         `INSERT INTO public.payout_batches (week_start, week_end, created_by, csv_downloaded_at)
          VALUES ($1, $2, $3, NOW())
@@ -429,7 +435,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
       'Payee Name', 'Individual ID (TRN)', 'Bank Name', 'Transit Code',
       'Account Type', 'Account Number', 'Amount', 'Currency', 'Reference', 'Payment Date',
     ];
-    if (includePaid) header.push('Status');
+    if (nonBank) header.push('Status');
     if (fullReview) {
       header.push(
         'Account Ownership', 'Business Name', 'SWIFT/BIC Code', 'Bank Branch',
@@ -439,7 +445,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
     const csvLines = [header, ...rows].map((row) =>
       row.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')
     );
-    if (includePaid) {
+    if (nonBank) {
       // A clearer marker than the filename suffix alone: Amount is 0 for
       // fully-paid rows here and the Status column changes the layout, but
       // it's still easy to mistake for the bank file at a glance. This
@@ -451,7 +457,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
     }
     const csv = csvLines.join('\r\n');
 
-    const filenameSuffix = fullReview ? '-full-review' : (includePaid ? '-records' : '-bank-upload');
+    const filenameSuffix = fullReview ? '-full-review' : (nonBank ? '-records' : '-bank-upload');
     res.set('Content-Type', 'text/csv; charset=utf-8');
     res.set('Content-Disposition', `attachment; filename="tendrit-payout-${weekStart}${filenameSuffix}.csv"`);
     res.set('X-Skipped-Providers', String(skipped));
