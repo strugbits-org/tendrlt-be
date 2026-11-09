@@ -247,6 +247,13 @@ router.get('/:weekStart/export-csv', async (req, res) => {
   const fullReview = !bankOnly && req.query.includePaid !== '1';
   const includePaid = !bankOnly;
   const statuses = includePaid ? PAYABLE_STATUSES : ['completed'];
+  // The full-review-only columns (SWIFT, branch, address, currency, ABA)
+  // exist on provider_payment_details since its original migration, not
+  // something this feature added — but ?bank=1 (the real bank submission)
+  // has no use for them, so they're only fetched/decrypted when fullReview
+  // actually needs them, keeping that path's PII surface unchanged.
+  const extraCols = fullReview ? ', pd.swift_code, pd.bank_branch, pd.bank_address, pd.currency, pd.aba_routing_encrypted' : '';
+  const extraGroupBy = fullReview ? ', pd.swift_code, pd.bank_branch, pd.bank_address, pd.currency, pd.aba_routing_encrypted' : '';
   try {
     const result = await db.query(`
       SELECT
@@ -258,8 +265,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         bool_or(tx.status = 'paid') AS any_paid,
         pd.payee_first_name, pd.middle_initial, pd.payee_surname, pd.business_name, pd.account_ownership,
         pd.recipient_id, pd.bank_name, pd.transit_code, pd.account_type,
-        pd.account_number_encrypted,
-        pd.swift_code, pd.bank_branch, pd.bank_address, pd.currency, pd.aba_routing_encrypted
+        pd.account_number_encrypted${extraCols}
       FROM public.transactions tx
       LEFT JOIN public.provider_payment_details pd ON pd.provider_id = tx.provider_id
       WHERE tx.status = ANY($2::transaction_status[])
@@ -267,8 +273,7 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         AND tx.completed_at < (($1::date + INTERVAL '7 days') AT TIME ZONE 'America/Jamaica')
       GROUP BY tx.provider_id, pd.payee_first_name, pd.middle_initial, pd.payee_surname,
                pd.business_name, pd.account_ownership, pd.recipient_id, pd.bank_name,
-               pd.transit_code, pd.account_type, pd.account_number_encrypted,
-               pd.swift_code, pd.bank_branch, pd.bank_address, pd.currency, pd.aba_routing_encrypted
+               pd.transit_code, pd.account_type, pd.account_number_encrypted${extraGroupBy}
     `, [weekStart, statuses]);
 
     const weekEnd = new Date(weekStart);
@@ -283,6 +288,19 @@ router.get('/:weekStart/export-csv', async (req, res) => {
     // for a downloaded file) would otherwise render a multi-byte
     // character as mojibake.
     const mask = (digits) => (digits.length <= 4 ? digits : '*'.repeat(digits.length - 4) + digits.slice(-4));
+
+    // CSV/formula injection: a free-text field (bank_name, bank_branch,
+    // bank_address, business_name, etc. all allow an "Other" manual-entry
+    // fallback on the provider's Payment Info form) starting with =, +, -,
+    // or @ is interpreted as a formula by Excel/Sheets when this file is
+    // opened — which is the expected workflow for the review/records
+    // exports. Prefixing with a quote keeps it inert text without changing
+    // the visible value. Left out of the bank-upload file so that format
+    // never changes.
+    const csvSafe = (v) => {
+      const s = String(v);
+      return /^[=+\-@]/.test(s) ? `'${s}` : s;
+    };
 
     const rows = [];
     let skipped = 0;
@@ -303,18 +321,25 @@ router.get('/:weekStart/export-csv', async (req, res) => {
         accountNumber = mask(String(accountNumber));
       }
 
-      const payeeName = r.account_ownership === 'business' && r.business_name
+      let payeeName = r.account_ownership === 'business' && r.business_name
         ? r.business_name
         : [r.payee_first_name, r.middle_initial, r.payee_surname].filter(Boolean).join(' ');
+      let bankNameCell = r.bank_name || '';
+      let accountTypeCell = r.account_type || '';
+      if (includePaid) {
+        payeeName = csvSafe(payeeName);
+        bankNameCell = csvSafe(bankNameCell);
+        accountTypeCell = csvSafe(accountTypeCell);
+      }
 
       if (r.all_paid) alreadyPaidCount++;
 
       const row = [
         payeeName,
         r.recipient_id || '',
-        r.bank_name || '',
+        bankNameCell,
         r.transit_code || '',
-        r.account_type || '',
+        accountTypeCell,
         accountNumber || '',
         (Number(r.provider_payout_cents) / 100).toFixed(2),
         'JMD',
@@ -339,11 +364,11 @@ router.get('/:weekStart/export-csv', async (req, res) => {
           }
         }
         row.push(
-          r.account_ownership || '',
-          r.business_name || '',
-          r.swift_code || '',
-          r.bank_branch || '',
-          r.bank_address || '',
+          csvSafe(r.account_ownership || ''),
+          csvSafe(r.business_name || ''),
+          csvSafe(r.swift_code || ''),
+          csvSafe(r.bank_branch || ''),
+          csvSafe(r.bank_address || ''),
           aba,
           (r.currency || 'jmd').toUpperCase(),
         );
