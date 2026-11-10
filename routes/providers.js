@@ -673,24 +673,11 @@ router.put('/payment', authenticate, authorize('provider'), async (req, res) => 
     middle_initial,
     payee_surname,
     recipient_id,
-    contact_address_line1,
-    contact_address_line2,
-    contact_address_line3,
-    contact_city,
-    contact_country,
-    contact_state,
-    contact_zip,
-    contact_phone,
-    contact_email,
     bank_name,
     bank_branch,
     swift_code,
     transit_code,
     bank_address,
-    bank_city,
-    bank_country,
-    bank_state,
-    bank_zip,
     account_type,
     currency,
     account_number,   // raw — encrypted here, never stored in the clear
@@ -731,6 +718,16 @@ router.put('/payment', authenticate, authorize('provider'), async (req, res) => 
       ? paymentCrypto.encrypt(String(aba_routing).replace(/\s/g, ''))
       : null;
 
+    // Contact Information and bank city/country/state/zip are deliberately
+    // left out of both params and the SQL below — the provider onboarding UI
+    // no longer collects them (see app/provider-onboarding/page.tsx), and
+    // those columns are read-only history from here on. Earlier versions of
+    // this endpoint unconditionally overwrote them with null on every save
+    // once the frontend stopped sending them, silently destroying any
+    // previously-saved values for an existing provider editing any other
+    // field; leaving them out of the SET/INSERT clauses entirely means an
+    // existing row's values are left untouched, and a new row just gets the
+    // column defaults (null, or 'Jamaica' for the country columns) instead.
     const commonParams = [
       req.user.id,
       ownership,
@@ -739,24 +736,11 @@ router.put('/payment', authenticate, authorize('provider'), async (req, res) => 
       ownership === 'personal' && middle_initial ? String(middle_initial).trim() : null,
       String(payee_surname).trim(),
       String(recipient_id).trim(),
-      contact_address_line1 ? String(contact_address_line1).trim() : null,
-      contact_address_line2 ? String(contact_address_line2).trim() : null,
-      contact_address_line3 ? String(contact_address_line3).trim() : null,
-      contact_city    ? String(contact_city).trim()    : null,
-      contact_country ? String(contact_country).trim() : 'Jamaica',
-      contact_state   ? String(contact_state).trim()   : null,
-      contact_zip     ? String(contact_zip).trim()     : null,
-      contact_phone   ? String(contact_phone).trim()   : null,
-      contact_email   ? String(contact_email).trim()   : null,
       String(bank_name).trim(),
       bank_branch ? String(bank_branch).trim() : null,
       swift_code ? String(swift_code).trim() : null,
       transit_code ? String(transit_code).trim() : null,
       bank_address ? String(bank_address).trim() : null,
-      bank_city    ? String(bank_city).trim()    : null,
-      bank_country ? String(bank_country).trim() : 'Jamaica',
-      bank_state   ? String(bank_state).trim()   : null,
-      bank_zip     ? String(bank_zip).trim()     : null,
       String(account_type).trim(),
       currency ? String(currency).trim() : 'jmd',
       abaEnc,
@@ -770,13 +754,10 @@ router.put('/payment', authenticate, authorize('provider'), async (req, res) => 
         `INSERT INTO public.provider_payment_details
            (provider_id, account_ownership, business_name, payee_first_name, middle_initial, payee_surname,
             recipient_id,
-            contact_address_line1, contact_address_line2, contact_address_line3,
-            contact_city, contact_country, contact_state, contact_zip, contact_phone, contact_email,
             bank_name, bank_branch, swift_code, transit_code, bank_address,
-            bank_city, bank_country, bank_state, bank_zip,
             account_type, currency, aba_routing_encrypted,
             account_number_encrypted, account_number_last4)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
          ON CONFLICT (provider_id) DO UPDATE SET
             account_ownership        = EXCLUDED.account_ownership,
             business_name            = EXCLUDED.business_name,
@@ -784,24 +765,11 @@ router.put('/payment', authenticate, authorize('provider'), async (req, res) => 
             middle_initial           = EXCLUDED.middle_initial,
             payee_surname            = EXCLUDED.payee_surname,
             recipient_id             = EXCLUDED.recipient_id,
-            contact_address_line1    = EXCLUDED.contact_address_line1,
-            contact_address_line2    = EXCLUDED.contact_address_line2,
-            contact_address_line3    = EXCLUDED.contact_address_line3,
-            contact_city             = EXCLUDED.contact_city,
-            contact_country          = EXCLUDED.contact_country,
-            contact_state            = EXCLUDED.contact_state,
-            contact_zip              = EXCLUDED.contact_zip,
-            contact_phone            = EXCLUDED.contact_phone,
-            contact_email            = EXCLUDED.contact_email,
             bank_name                = EXCLUDED.bank_name,
             bank_branch              = EXCLUDED.bank_branch,
             swift_code               = EXCLUDED.swift_code,
             transit_code             = EXCLUDED.transit_code,
             bank_address             = EXCLUDED.bank_address,
-            bank_city                = EXCLUDED.bank_city,
-            bank_country             = EXCLUDED.bank_country,
-            bank_state               = EXCLUDED.bank_state,
-            bank_zip                 = EXCLUDED.bank_zip,
             account_type             = EXCLUDED.account_type,
             currency                 = EXCLUDED.currency,
             aba_routing_encrypted    = EXCLUDED.aba_routing_encrypted,
@@ -820,27 +788,14 @@ router.put('/payment', authenticate, authorize('provider'), async (req, res) => 
             middle_initial        = $5,
             payee_surname         = $6,
             recipient_id          = $7,
-            contact_address_line1 = $8,
-            contact_address_line2 = $9,
-            contact_address_line3 = $10,
-            contact_city          = $11,
-            contact_country       = $12,
-            contact_state         = $13,
-            contact_zip           = $14,
-            contact_phone         = $15,
-            contact_email         = $16,
-            bank_name             = $17,
-            bank_branch           = $18,
-            swift_code            = $19,
-            transit_code          = $20,
-            bank_address          = $21,
-            bank_city             = $22,
-            bank_country          = $23,
-            bank_state            = $24,
-            bank_zip              = $25,
-            account_type          = $26,
-            currency              = $27,
-            aba_routing_encrypted = $28,
+            bank_name             = $8,
+            bank_branch           = $9,
+            swift_code            = $10,
+            transit_code          = $11,
+            bank_address          = $12,
+            account_type          = $13,
+            currency              = $14,
+            aba_routing_encrypted = $15,
             updated_at            = NOW()
           WHERE provider_id = $1`,
         commonParams
