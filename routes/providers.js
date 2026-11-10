@@ -7,7 +7,7 @@ const { authenticate, authorize } = require('../middleware/auth');
 const { notifyChannel } = require('../lib/realtimeService');
 const { sendNewProviderSubmittedEmail } = require('../lib/verificationEmails');
 const paymentCrypto = require('../lib/paymentCrypto');
-const { createVerificationSession, getSessionDecision, mapDiditStatus, extractCheckSummary } = require('../lib/didit');
+const { createVerificationSession, getSessionDecision, mapDiditStatus, isDiditSessionNotStarted, extractCheckSummary } = require('../lib/didit');
 
 const router = express.Router();
 
@@ -178,7 +178,20 @@ router.post('/verification/refresh', authenticate, authorize('provider'), async 
     const diditStatus = mapDiditStatus(decision?.status);
 
     if (!diditStatus) {
-      // Still non-terminal at Didit (e.g. in progress) — nothing new to write.
+      if (isDiditSessionNotStarted(decision?.status)) {
+        // Session creation optimistically wrote 'pending' before the
+        // provider did anything — if Didit confirms they never actually
+        // started, that optimism was wrong. Reset so they get a working
+        // "Start identity verification" button instead of being stuck
+        // behind a "Refresh status" button Didit can never resolve.
+        await db.queryAsUser(req.user.id,
+          `UPDATE public.provider_profiles SET didit_status = 'not_started', updated_at = NOW() WHERE provider_id = $1`,
+          [req.user.id]
+        );
+        return res.json({ success: true, diditStatus: 'not_started' });
+      }
+      // Still genuinely non-terminal at Didit (e.g. in progress right now
+      // in another tab) — nothing new to write.
       return res.json({ success: true, diditStatus: row?.didit_status || 'pending' });
     }
 
