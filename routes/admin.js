@@ -1353,7 +1353,7 @@ const REVENUE_WINDOWS = { '7d': 7, '30d': 30, '90d': 90, '1y': 365, all: null };
 const compactMoney = (cents) => {
   const d = Math.round((cents || 0) / 100);
   if (d >= 1e6) return (d / 1e6).toFixed(2).replace(/\.?0+$/, '') + 'M';
-  if (d >= 1e3) return Math.round(d / 1e3) + 'K';
+  if (d >= 1e3) return (d / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
   return d.toLocaleString('en-US');
 };
 const fullMoney = (cents) => Math.round((cents || 0) / 100).toLocaleString('en-US');
@@ -1407,6 +1407,9 @@ router.get('/revenue', async (req, res) => {
           COALESCE(SUM(platform_fee) FILTER (WHERE ${windowCond}), 0)::bigint AS rev,
           COUNT(*)                    FILTER (WHERE ${windowCond})::int AS done,
           COALESCE(SUM(platform_fee) FILTER (WHERE $1::int IS NOT NULL AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1)), 0)::bigint AS prev_rev,
+          COALESCE(SUM(client_fee)   FILTER (WHERE $1::int IS NOT NULL AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1)), 0)::bigint AS prev_cfee,
+          COALESCE(SUM(provider_fee) FILTER (WHERE $1::int IS NOT NULL AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1)), 0)::bigint AS prev_pfee,
+          COALESCE(SUM(amount)       FILTER (WHERE $1::int IS NOT NULL AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1)), 0)::bigint AS prev_gmv,
           COUNT(*)                    FILTER (WHERE $1::int IS NOT NULL AND created_at >= NOW() - (INTERVAL '1 day' * $1 * 2) AND created_at < NOW() - (INTERVAL '1 day' * $1))::int AS prev_done
         FROM public.transactions
         WHERE status NOT IN ('awaiting_payment', 'payment_failed')
@@ -1485,17 +1488,19 @@ router.get('/revenue', async (req, res) => {
     const agg = aggRes.rows[0];
 
     // Delta vs the immediately preceding window of equal length (skip for all-time).
-    let deltaRev = '—';
-    if (days !== null) {
-      const prevRev = Number(c.prev_rev);
-      const curRev = Number(c.rev);
-      if (prevRev > 0) {
-        const pct = ((curRev - prevRev) / prevRev) * 100;
-        deltaRev = `${pct >= 0 ? '↑' : '↓'} ${Math.abs(pct).toFixed(1)}%`;
-      } else if (curRev > 0) {
-        deltaRev = '↑ new';
+    const moneyDelta = (curVal, prevVal) => {
+      if (days === null) return '—';
+      const cur = Number(curVal), prev = Number(prevVal);
+      if (prev > 0) {
+        const pct = ((cur - prev) / prev) * 100;
+        return `${pct >= 0 ? '↑' : '↓'} ${Math.abs(pct).toFixed(1)}%`;
       }
-    }
+      return cur > 0 ? '↑ new' : '—';
+    };
+    const deltaRev = moneyDelta(c.rev, c.prev_rev);
+    const deltaCfee = moneyDelta(c.cfee, c.prev_cfee);
+    const deltaPfee = moneyDelta(c.pfee, c.prev_pfee);
+    const deltaGmv = moneyDelta(c.gmv, c.prev_gmv);
 
     const done = c.done || 0;
     const jobs = tr.jobs || 0;
@@ -1597,6 +1602,9 @@ router.get('/revenue', async (req, res) => {
         gmv: compactMoney(c.gmv),
         done,
         delta_rev: deltaRev,
+        delta_cfee: deltaCfee,
+        delta_pfee: deltaPfee,
+        delta_gmv: deltaGmv,
         fee_clients: fullMoney(c.cfee),
         fee_provs: fullMoney(c.pfee),
         fee_per_job: done ? 'J$' + fullMoney(Number(c.rev) / done) : 'J$0',
