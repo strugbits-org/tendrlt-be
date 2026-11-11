@@ -7,7 +7,7 @@ const { authenticate, authorize } = require('../middleware/auth');
 const { notifyChannel } = require('../lib/realtimeService');
 const { sendNewProviderSubmittedEmail } = require('../lib/verificationEmails');
 const paymentCrypto = require('../lib/paymentCrypto');
-const { createVerificationSession, getSessionDecision, mapDiditStatus, extractCheckSummary } = require('../lib/didit');
+const { createVerificationSession, getSessionDecision, mapDiditStatus, isDiditSessionIncomplete, extractCheckSummary } = require('../lib/didit');
 
 const router = express.Router();
 
@@ -177,9 +177,21 @@ router.post('/verification/refresh', authenticate, authorize('provider'), async 
     const decision = await getSessionDecision(sessionId);
     const diditStatus = mapDiditStatus(decision?.status);
 
-    if (!diditStatus) {
-      // Still non-terminal at Didit (e.g. in progress) — nothing new to write.
-      return res.json({ success: true, diditStatus: row?.didit_status || 'pending' });
+    // isDiditSessionIncomplete(decision?.status) is equivalent to !diditStatus
+    // here — kept as a named predicate in lib/didit.js for what it actually
+    // means (see its comment there), not just "falsy".
+    if (isDiditSessionIncomplete(decision?.status)) {
+      // Session creation optimistically wrote 'pending' before the provider
+      // did anything — if Didit confirms the hosted flow isn't actively
+      // progressing (they're back on our page asking, after all), that
+      // optimism was wrong. Reset so they get a working "Start identity
+      // verification" button instead of being stuck behind a "Refresh
+      // status" button Didit can never resolve.
+      await db.queryAsUser(req.user.id,
+        `UPDATE public.provider_profiles SET didit_status = 'not_started', updated_at = NOW() WHERE provider_id = $1`,
+        [req.user.id]
+      );
+      return res.json({ success: true, diditStatus: 'not_started' });
     }
 
     const { documentType, checkSummary } = extractCheckSummary(decision);
